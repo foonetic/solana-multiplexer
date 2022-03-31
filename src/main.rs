@@ -185,7 +185,7 @@ impl Forwarder {
                             // subscribe to the websocket.
                             let notification = AccountNotification {
                                 jsonrpc: account_info.jsonrpc,
-                                method: "accountSubscribe".to_string(),
+                                method: "accountNotification".to_string(),
                                 params: NotificationParams {
                                     result: account_info.result,
                                     subscription: account_info.id,
@@ -550,7 +550,7 @@ impl Instruction {
     }
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let urls = vec![
         Endpoint {

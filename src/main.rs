@@ -1,5 +1,5 @@
 /// Implements a simple Solana request multiplexer.
-/// 
+///
 /// The multiplexer dispatches account subscriptions to multiple validators and
 /// arbitrates responses to return the freshest data.
 use futures_util::{SinkExt, StreamExt};
@@ -20,11 +20,20 @@ use tokio_tungstenite::{
 };
 use url::Url;
 
+/// A websocket account notification.
 #[derive(Serialize, Deserialize, Debug, Clone)]
-struct AccountNotification {
+pub struct AccountNotification {
     jsonrpc: String,
     method: String,
     params: NotificationParams,
+}
+
+/// A synchronous account info result.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct AccountInfo {
+    jsonrpc: String,
+    result: NotificationResult,
+    id: u64,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -46,14 +55,18 @@ struct NotificationContext {
 
 struct Forwarder {
     websocket: WebSocketStream<MaybeTlsStream<TcpStream>>,
+    client: Arc<reqwest::Client>,
+    rpc_url: Url,
     subscription_to_id: HashMap<u64, u64>,
 }
 
 impl Forwarder {
-    async fn new(url: &Url) -> Result<Self> {
-        let (websocket, _) = connect_async(url).await?;
+    async fn new(websocket_url: &Url, rpc_url: Url) -> Result<Self> {
+        let (websocket, _) = connect_async(websocket_url).await?;
         Ok(Forwarder {
             websocket,
+            client: Arc::new(reqwest::Client::new()),
+            rpc_url,
             subscription_to_id: HashMap::new(),
         })
     }
@@ -69,8 +82,16 @@ impl Forwarder {
             tokio::select! {
                 // Process new subscriptions first, since these should be
                 // relatively rare. Send the subscription as-is.
-                Some(cmd) = receive_from_multiplexer.recv() => {
-                    self.websocket.send(Message::from(serde_json::to_string(&cmd).unwrap())).await.unwrap();
+                Some(instruction) = receive_from_multiplexer.recv() => {
+                    self.websocket.send(Message::from(serde_json::to_string(&instruction).unwrap())).await.unwrap();
+
+                    // Regularly make synchronous requests and arbitrate with
+                    // the websocket. Note that the instruction id that was sent
+                    // by the multiplexer is the global counter that the
+                    // multiplexer expects to receive back. This means we can
+                    // send the instruction as-is since the rpc server will echo
+                    // back the id.
+                    Self::create_synchronous_subscription(self.client.clone(), self.rpc_url.clone(), &instruction, &send_to_multiplexer);
                 }
 
                 // If any data is available to be read, process it next.
@@ -91,6 +112,46 @@ impl Forwarder {
                 }
             }
         }
+    }
+
+    fn create_synchronous_subscription(
+        client: Arc<reqwest::Client>,
+        rpc_url: Url,
+        instruction: &Instruction,
+        send_to_multiplexer: &UnboundedSender<AccountNotification>,
+    ) {
+        let mut instruction = instruction.clone();
+        instruction.method = "getAccountInfo".to_string();
+        let instruction = serde_json::to_string(&instruction).unwrap();
+        let send_to_multiplexer = send_to_multiplexer.clone();
+        tokio::spawn(async move {
+            let mut interval = time::interval(std::time::Duration::from_secs(1));
+            loop {
+                interval.tick().await;
+                if let Ok(result) = client
+                    .post(rpc_url.clone())
+                    .body(instruction.clone())
+                    .header("content-type", "application/json")
+                    .send()
+                    .await
+                {
+                    if let Ok(text) = result.text().await {
+                        if let Ok(account_info) = serde_json::from_str::<AccountInfo>(&text) {
+                            let notification = AccountNotification {
+                                jsonrpc: account_info.jsonrpc,
+                                method: "accountSubscribe".to_string(),
+                                params: NotificationParams {
+                                    result: account_info.result,
+                                    subscription: account_info.id,
+                                },
+                            };
+
+                            send_to_multiplexer.send(notification).unwrap();
+                        }
+                    }
+                }
+            }
+        });
     }
 
     /// Registers the subscription to the multiplexer id. Note that the same
@@ -137,12 +198,17 @@ pub struct Multiplexer {
     client_id_to_send: Arc<Mutex<HashMap<u64, UnboundedSender<AccountNotification>>>>,
 }
 
+pub struct Endpoint {
+    pub rpc: Url,
+    pub websocket: Url,
+}
+
 impl Multiplexer {
-    pub async fn new(urls: &[Url]) -> Result<Self> {
+    pub async fn new(urls: &[Endpoint]) -> Result<Self> {
         let mut forwarders = Vec::new();
 
-        for url in urls.iter() {
-            let node = Forwarder::new(url).await?;
+        for endpoint in urls.iter() {
+            let node = Forwarder::new(&endpoint.websocket, endpoint.rpc.clone()).await?;
             forwarders.push(node);
         }
 
@@ -390,17 +456,17 @@ impl Instruction {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
-struct InstructionWithSender {
-    instruction: Instruction,
-    sender: u64,
-}
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let urls = vec![
-        Url::parse("wss://api.mainnet-beta.solana.com:443").unwrap(),
-        Url::parse("wss://solana-api.projectserum.com:443").unwrap(),
+        Endpoint {
+            websocket: Url::parse("wss://api.mainnet-beta.solana.com:443").unwrap(),
+            rpc: Url::parse("https://api.mainnet-beta.solana.com:443").unwrap(),
+        },
+        Endpoint {
+            websocket: Url::parse("wss://solana-api.projectserum.com:443").unwrap(),
+            rpc: Url::parse("https://solana-api.projectserum.com:443").unwrap(),
+        },
     ];
     let mut multiplexer = Multiplexer::new(&urls).await.unwrap();
     multiplexer.run("0.0.0.0:8900").await;

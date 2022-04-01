@@ -51,18 +51,21 @@ pub struct Multiplexer {
 /// and websocket endpoints to exist for a logical endpoint. The RPC endpoint
 /// will be polled synchronously and arbitrated against the websocket. It is
 /// possible to disable either of these sources.
-pub struct Endpoint {
-    pub rpc: Option<Url>,
-    pub websocket: Option<Url>,
+pub enum Endpoint {
+    /// JSON RPC endpoint with a polling frequencye.
+    Rpc(Url, std::time::Duration),
+
+    /// Streaming endpoint.
+    WebSocket(Url),
 }
 
 impl Multiplexer {
     /// Connects to the given endpoints.
-    pub async fn new(urls: &[Endpoint]) -> Result<Self> {
+    pub async fn new(endpoints: &[Endpoint]) -> Result<Self> {
         let mut forwarders = Vec::new();
 
-        for endpoint in urls.iter() {
-            let node = Forwarder::new(endpoint.websocket.clone(), endpoint.rpc.clone()).await?;
+        for endpoint in endpoints.iter() {
+            let node = Forwarder::new(endpoint.clone()).await?;
             forwarders.push(node);
         }
 

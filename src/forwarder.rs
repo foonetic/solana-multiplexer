@@ -1,39 +1,47 @@
-use crate::messages::*;
+use crate::{messages::*, multiplexer::Endpoint};
 use futures_util::{SinkExt, StreamExt};
 use std::{collections::HashMap, sync::Arc};
 use tokio::{
-    net::TcpStream,
     sync::mpsc::{UnboundedReceiver, UnboundedSender},
     time,
 };
 use tokio_tungstenite::{
     connect_async,
     tungstenite::{Message, Result},
-    {MaybeTlsStream, WebSocketStream},
 };
 use url::Url;
 
 /// Manages communication with a single rpc endpoint.
 pub struct Forwarder {
-    websocket: Option<WebSocketStream<MaybeTlsStream<TcpStream>>>,
-    client: Arc<reqwest::Client>,
-    rpc_url: Option<Url>,
+    interface: Interface,
     subscription_to_id: HashMap<u64, u64>,
 }
 
+enum Interface {
+    Rpc((Arc<reqwest::Client>, Url, std::time::Duration)),
+    WebSocket(
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    ),
+}
+
 impl Forwarder {
-    pub async fn new(websocket_url: Option<Url>, rpc_url: Option<Url>) -> Result<Self> {
-        let websocket = if let Some(websocket_url) = websocket_url {
-            let (websocket, _) = connect_async(websocket_url).await?;
-            Some(websocket)
-        } else {
-            None
+    pub async fn new(endpoint: &Endpoint) -> Result<Self> {
+        let interface = match endpoint {
+            Endpoint::Rpc(url, poll_frequency) => Interface::Rpc((
+                Arc::new(reqwest::Client::new()),
+                url.clone(),
+                poll_frequency.clone(),
+            )),
+            Endpoint::WebSocket(url) => {
+                let (websocket, _) = connect_async(url).await?;
+                Interface::WebSocket(websocket)
+            }
         };
 
         Ok(Forwarder {
-            websocket,
-            client: Arc::new(reqwest::Client::new()),
-            rpc_url,
+            interface,
             subscription_to_id: HashMap::new(),
         })
     }
@@ -47,60 +55,59 @@ impl Forwarder {
     ) {
         let mut interval = time::interval(std::time::Duration::from_secs(10));
 
-        // Since self.websocket is Optional, we cannot cleanly use a single
-        // tokio select. Unwrapping the websocket panics, even if we gate the
-        // selection by an if statement.
-        if self.websocket.is_some() {
-            loop {
-                tokio::select! {
+        match &mut self.interface {
+            &mut Interface::Rpc((ref client, ref url, ref poll_frequency)) => {
+                loop {
                     // Process new subscriptions first, since these should be
                     // relatively rare. Send the subscription as-is.
-                    Some(instruction) = receive_from_multiplexer.recv() => {
-                        self.websocket.as_mut().unwrap().send(Message::from(serde_json::to_string(&instruction).unwrap())).await.unwrap();
-
+                    if let Some(instruction) = receive_from_multiplexer.recv().await {
                         // Regularly make synchronous requests and arbitrate with
                         // the websocket. Note that the instruction id that was sent
                         // by the multiplexer is the global counter that the
                         // multiplexer expects to receive back. This means we can
                         // send the instruction as-is since the rpc server will echo
                         // back the id.
-                        if let Some(ref mut rpc_url) = self.rpc_url {
-                            Self::create_synchronous_subscription(self.client.clone(), rpc_url.clone(), &instruction, &send_to_multiplexer);
-                        }
-                    }
-
-                    // If any data is available to be read, process it next.
-                    item = self.websocket.as_mut().unwrap().next() => {
-                        if let Some(item) = item {
-                            let data = item.unwrap().into_text().unwrap();
-                            if let Ok(reply) = serde_json::from_str::<SubscriptionReply>(&data) {
-                                self.on_subscription_reply(&reply);
-                            } else if let Ok(reply) = serde_json::from_str::<AccountNotification>(&data) {
-                                self.on_account_notification(&reply, &send_to_multiplexer);
-                            }
-                        }
-                    }
-
-                    // Send a keepalive message.
-                    _ = interval.tick(), if self.websocket.as_mut().is_some() => {
-                        self.websocket.as_mut().unwrap().send(Message::from("{}")).await.unwrap();
+                        Self::create_synchronous_subscription(
+                            client.clone(),
+                            url.clone(),
+                            &instruction,
+                            &send_to_multiplexer,
+                            &poll_frequency,
+                        );
                     }
                 }
             }
-        } else {
-            loop {
-                tokio::select! {
-                    // Process new subscriptions first, since these should be
-                    // relatively rare. Send the subscription as-is.
-                    Some(instruction) = receive_from_multiplexer.recv() => {
-                        // Regularly make synchronous requests and arbitrate with
-                        // the websocket. Note that the instruction id that was sent
-                        // by the multiplexer is the global counter that the
-                        // multiplexer expects to receive back. This means we can
-                        // send the instruction as-is since the rpc server will echo
-                        // back the id.
-                        if let Some(ref mut rpc_url) = self.rpc_url {
-                            Self::create_synchronous_subscription(self.client.clone(), rpc_url.clone(), &instruction, &send_to_multiplexer);
+
+            &mut Interface::WebSocket(ref mut client) => {
+                loop {
+                    tokio::select! {
+                        // Process new subscriptions first, since these should be
+                        // relatively rare. Send the subscription as-is.
+                        Some(instruction) = receive_from_multiplexer.recv() => {
+                            client.send(Message::from(serde_json::to_string(&instruction).unwrap())).await.unwrap();
+                        }
+
+                        // If any data is available to be read, process it next.
+                        item = client.next() => {
+                            if let Some(item) = item {
+                                let data = item.unwrap().into_text().unwrap();
+                                if let Ok(reply) = serde_json::from_str::<SubscriptionReply>(&data) {
+                                    self.subscription_to_id.insert(reply.result, reply.id);
+                                } else if let Ok(reply) = serde_json::from_str::<AccountNotification>(&data) {
+                                    if let Some(id) = self.subscription_to_id.get(&reply.params.subscription) {
+                                        let mut reply = reply.clone();
+                                        reply.params.subscription = *id;
+                                        if send_to_multiplexer.send(reply).is_err() {
+                                            // TODO: Some error handling when we can't write to client.
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // Send a keepalive message.
+                        _ = interval.tick() => {
+                            client.send(Message::from("{}")).await.unwrap();
                         }
                     }
                 }
@@ -117,13 +124,15 @@ impl Forwarder {
         rpc_url: Url,
         instruction: &Instruction,
         send_to_multiplexer: &UnboundedSender<AccountNotification>,
+        poll_frequency: &std::time::Duration,
     ) {
         let mut instruction = instruction.clone();
         instruction.method = Method::getAccountInfo;
         let instruction = serde_json::to_string(&instruction).unwrap();
         let send_to_multiplexer = send_to_multiplexer.clone();
+        let poll_frequency = poll_frequency.clone();
         tokio::spawn(async move {
-            let mut interval = time::interval(std::time::Duration::from_secs(1));
+            let mut interval = time::interval(poll_frequency);
             loop {
                 interval.tick().await;
                 if let Ok(result) = client
@@ -157,32 +166,5 @@ impl Forwarder {
                 }
             }
         });
-    }
-
-    /// Registers the subscription to the multiplexer id. Note that the same
-    /// subscription may correspond to multiple ids. The multiplexer is
-    /// responsible for forwarding to all interested parties.
-    fn on_subscription_reply(&mut self, reply: &SubscriptionReply) {
-        self.subscription_to_id.insert(reply.result, reply.id);
-    }
-
-    /// Forwards the account notification to the multiplexer. The subscription
-    /// is replaced with the ID that the multiplexer originally passed to
-    /// initiate the subscription. Note that the same subscription may
-    /// correspond to multiple ids. The multiplexer is responsible for
-    /// forwarding messages to all interested parties.
-    fn on_account_notification(
-        &mut self,
-        reply: &AccountNotification,
-        send_to: &UnboundedSender<AccountNotification>,
-    ) {
-        if let Some(id) = self.subscription_to_id.get(&reply.params.subscription) {
-            let mut reply = reply.clone();
-            reply.params.subscription = *id;
-
-            if send_to.send(reply).is_err() {
-                // TODO: Some error handling when we can't write to client.
-            }
-        }
     }
 }

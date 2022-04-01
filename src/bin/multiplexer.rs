@@ -34,7 +34,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .endpoint
         .iter()
         .map(|s| {
-            let url = Url::parse(s).unwrap();
+            let url = if let Ok(url) = Url::parse(s) {
+                url
+            } else {
+                panic!("unable to parse url: {}", s);
+            };
+
             if s.starts_with("ws") {
                 Endpoint::WebSocket(url)
             } else if s.starts_with("http") {
@@ -43,12 +48,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     std::time::Duration::from_millis(args.poll_frequency_milliseconds),
                 )
             } else {
-                panic!("Invalid endpoint: {}", s);
+                panic!("endpoint could not be parsed as WebSocket or HTTP: {}", s);
             }
         })
         .collect();
 
-    let mut multiplexer = Multiplexer::new(&endpoints).await.unwrap();
+    let mut multiplexer = Multiplexer::new(&endpoints).await?;
     multiplexer.listen(&args.listen_address).await;
 
     Ok(())

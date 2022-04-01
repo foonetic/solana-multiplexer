@@ -1,10 +1,28 @@
 use serde::{Deserialize, Serialize};
+use serde_repr::*;
+
+#[derive(Serialize_repr, Deserialize_repr, Debug, Clone)]
+#[repr(i32)]
+pub enum ErrorCode {
+    ParseError = -32700,
+    InvalidRequest = -32600,
+    MethodNotFound = -32601,
+    InvalidParams = -32602,
+    InternalError = -32603,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct Error {
+    pub jsonrpc: String,
+    pub code: ErrorCode,
+    pub message: String,
+}
 
 /// A websocket account notification.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct AccountNotification {
     pub jsonrpc: String,
-    pub method: String,
+    pub method: Method,
     pub params: NotificationParams,
 }
 
@@ -43,12 +61,20 @@ pub struct SubscriptionReply {
     pub id: u64,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[allow(non_camel_case_types)]
+pub enum Method {
+    accountSubscribe,
+    getAccountInfo,
+    accountNotification,
+}
+
 /// Represents an instruction sent to an endpoint.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Instruction {
     pub jsonrpc: String,
     pub id: u64,
-    pub method: String,
+    pub method: Method,
     pub params: serde_json::Value,
 }
 

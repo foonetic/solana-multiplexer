@@ -119,7 +119,7 @@ impl Forwarder {
         send_to_multiplexer: &UnboundedSender<AccountNotification>,
     ) {
         let mut instruction = instruction.clone();
-        instruction.method = "getAccountInfo".to_string();
+        instruction.method = Method::getAccountInfo;
         let instruction = serde_json::to_string(&instruction).unwrap();
         let send_to_multiplexer = send_to_multiplexer.clone();
         tokio::spawn(async move {
@@ -142,7 +142,7 @@ impl Forwarder {
                             // subscribe to the websocket.
                             let notification = AccountNotification {
                                 jsonrpc: account_info.jsonrpc,
-                                method: "accountNotification".to_string(),
+                                method: Method::accountNotification,
                                 params: NotificationParams {
                                     result: account_info.result,
                                     subscription: account_info.id,

@@ -170,6 +170,14 @@ impl Multiplexer {
                                     global_counter_to_subscription.clone(),
                                     global_counter.clone(), &instruction, instruction.id,
                                     client_id, &send_instructions);
+                                } else {
+                                    let err = Error {
+                                        jsonrpc: "2.0".to_string(),
+                                        code: ErrorCode::InvalidRequest,
+                                        message: data,
+                                    };
+                                    let err = serde_json::to_string(&err).unwrap();
+                                    ws_stream.send(Message::from(err)).await.unwrap();
                                 }
                             }
                         }

@@ -81,15 +81,13 @@ impl Multiplexer {
 
         let send_instructions = self.run_communication_with_forwarders(&send_account_notification);
 
-        let global_counter_to_subscription = self.global_counter_to_subscription.clone();
-        let client_id_to_send = self.client_id_to_send.clone();
+        let mut return_arbitrator = ReturnArbitrator {
+            global_counter_to_subscription: self.global_counter_to_subscription.clone(),
+            client_id_to_send: self.client_id_to_send.clone(),
+            receive_account_notification: receive_account_notification,
+        };
         tokio::spawn(async move {
-            Self::run_arbitrate_notifications(
-                global_counter_to_subscription,
-                client_id_to_send,
-                receive_account_notification,
-            )
-            .await;
+            return_arbitrator.run().await;
         });
 
         self.run_websockset_server(send_instructions, addr).await;
@@ -130,8 +128,7 @@ impl Multiplexer {
         let send_instructions = Arc::new(send_instructions);
 
         while let Ok((stream, _)) = listener.accept().await {
-            let (send_to_client, mut receive_for_client) =
-                unbounded_channel::<AccountNotification>();
+            let (send_to_client, receive_for_client) = unbounded_channel();
             let send_instructions = send_instructions.clone();
 
             // Track the channel for each client.
@@ -142,119 +139,39 @@ impl Multiplexer {
                     .insert(client_id, send_to_client);
             }
 
-            let pubkey_to_global_counter = self.pubkey_to_global_counter.clone();
-            let global_counter_to_subscription = self.global_counter_to_subscription.clone();
-            let global_counter = self.global_counter.clone();
-            tokio::spawn(async move {
-                let mut ws_stream = tokio_tungstenite::accept_async(stream).await.unwrap();
-                loop {
-                    tokio::select! {
-                        // User sent a request. Dispatch it to each of the underlying
-                        // nodes. Use the same global counter for all of the nodes so
-                        // that we can map it back to the originating request.
-                        item = ws_stream.next() => {
-                            if let Some(item) = item {
-                                let data = item;
-                                if data.is_err() {
-                                    // TODO: Error handling when reading from client is interrupted.
-                                    return;
-                                }
-                                let data = data.unwrap().into_text();
-                                if data.is_err() {
-                                    // TODO: Error handling when reading from client is interrupted.
-                                    return;
-                                }
-                                let data = data.unwrap();
-                                if let Ok(instruction) = serde_json::from_str::<Instruction>(&data) {
-                                    Self::maybe_add_subscriber(pubkey_to_global_counter.clone(),
-                                    global_counter_to_subscription.clone(),
-                                    global_counter.clone(), &instruction, instruction.id,
-                                    client_id, &send_instructions);
-                                } else {
-                                    let err = Error {
-                                        jsonrpc: "2.0".to_string(),
-                                        code: ErrorCode::InvalidRequest,
-                                        message: data,
-                                    };
-                                    let err = serde_json::to_string(&err).unwrap();
-                                    ws_stream.send(Message::from(err)).await.unwrap();
-                                }
-                            }
-                        }
+            let ws_stream = tokio_tungstenite::accept_async(stream).await.unwrap();
 
-                        // We received a notification that needs to be sent to
-                        // the client. The multiplexer is responsible for
-                        // setting the subscription correctly.
-                        Some(notification) = receive_for_client.recv() => {
-                            ws_stream.send(Message::from(serde_json::to_string(&notification).unwrap())).await.unwrap();
-                        }
-                    }
-                }
+            let mut client_handler = ClientHandler {
+                client_id,
+                ws_stream,
+                pubkey_to_global_counter: self.pubkey_to_global_counter.clone(),
+                global_counter_to_subscription: self.global_counter_to_subscription.clone(),
+                global_counter: self.global_counter.clone(),
+                send_instructions: send_instructions.clone(),
+                receive_for_client,
+            };
+            tokio::spawn(async move {
+                client_handler.run().await;
             });
             client_id += 1;
         }
     }
+}
 
-    /// Adds a subscriber if the pubkey isn't already a subscription. If it is a
-    /// subscription, there's no need to relay a new subscription. Instead, the
-    /// client will be relayed the existing subscription data.
-    fn maybe_add_subscriber(
-        pubkey_to_global_counter: Arc<Mutex<HashMap<String, u64>>>,
-        global_counter_to_subscription: Arc<Mutex<HashMap<u64, HashSet<(u64, u64)>>>>,
-        global_counter: Arc<Mutex<u64>>,
-        instruction: &Instruction,
-        client_instruction_id: u64,
-        client_id: u64,
-        send_instructions: &[UnboundedSender<Instruction>],
-    ) {
-        if let Some(pubkey) = instruction.get_pubkey() {
-            let mut pubkey_to_global_counter = pubkey_to_global_counter.lock().unwrap();
-            if let Some(global_counter) = pubkey_to_global_counter.get(&pubkey) {
-                // The pubkey is already subscribed to. Add this client to the list of
-                // clients we should broadcast to, but don't repeat the subscription.
-                let mut global_counter_to_subscription =
-                    global_counter_to_subscription.lock().unwrap();
-                if let Some(set) = global_counter_to_subscription.get_mut(global_counter) {
-                    set.insert((client_instruction_id, client_id));
-                }
-            } else {
-                // The pubkey isn't subscribed to.
-                let mut set = HashSet::new();
-                set.insert((client_instruction_id, client_id));
-                let global_counter = {
-                    let mut global_counter = global_counter.lock().unwrap();
-                    pubkey_to_global_counter.insert(pubkey.to_string(), *global_counter);
-                    *global_counter += 1;
-                    *global_counter - 1
-                };
+/// Runs the event loop for arbitrating messages. Arbitration is keyed by slot
+/// number for a fixed subscription identifier. The subscription id is
+/// guaranteed by the forwarders to be a global unique id passed from the
+/// multiplexer.
+struct ReturnArbitrator {
+    global_counter_to_subscription: Arc<Mutex<HashMap<u64, HashSet<(u64, u64)>>>>,
+    client_id_to_send: Arc<Mutex<HashMap<u64, UnboundedSender<AccountNotification>>>>,
+    receive_account_notification: UnboundedReceiver<AccountNotification>,
+}
 
-                {
-                    let mut global_counter_to_subscription =
-                        global_counter_to_subscription.lock().unwrap();
-                    global_counter_to_subscription.insert(global_counter, set);
-                }
-
-                // Dispatch to the underlying forwarders.
-                let mut instruction = instruction.clone();
-                instruction.id = global_counter;
-                for sender in send_instructions.iter() {
-                    sender.send(instruction.clone()).unwrap();
-                }
-            }
-        }
-    }
-
-    /// Runs the event loop for arbitrating messages. Arbitration is keyed by
-    /// slot number for a fixed subscription identifier. The subscription id is
-    /// guaranteed by the forwarders to be a global unique id passed from the
-    /// multiplexer.
-    async fn run_arbitrate_notifications(
-        global_counter_to_subscription: Arc<Mutex<HashMap<u64, HashSet<(u64, u64)>>>>,
-        client_id_to_send: Arc<Mutex<HashMap<u64, UnboundedSender<AccountNotification>>>>,
-        mut notifications: UnboundedReceiver<AccountNotification>,
-    ) {
+impl ReturnArbitrator {
+    async fn run(&mut self) {
         let mut slot_by_subscription = HashMap::new();
-        while let Some(result) = notifications.recv().await {
+        while let Some(result) = self.receive_account_notification.recv().await {
             // Send if the update slot number is more recent than any previously
             // sent update.
             let should_send =
@@ -279,8 +196,9 @@ impl Multiplexer {
                 // most one subscribe call. On the call, the subscription id is
                 // guaranteed to be a global_counter value. Map that back to the clients
                 // we need to send to.
-                let global_counter_to_subscription = global_counter_to_subscription.lock().unwrap();
-                let client_id_to_send = client_id_to_send.lock().unwrap();
+                let global_counter_to_subscription =
+                    self.global_counter_to_subscription.lock().unwrap();
+                let client_id_to_send = self.client_id_to_send.lock().unwrap();
                 if let Some(ref subscribers) =
                     global_counter_to_subscription.get(&result.params.subscription)
                 {
@@ -297,6 +215,104 @@ impl Multiplexer {
                             }
                         }
                     }
+                }
+            }
+        }
+    }
+}
+
+/// Handles an inbound client connection. Relays instructions to all forwarders
+/// and passes arbitrated notifications back to the client.
+struct ClientHandler {
+    client_id: u64,
+    ws_stream: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+    pubkey_to_global_counter: Arc<Mutex<HashMap<String, u64>>>,
+    global_counter_to_subscription: Arc<Mutex<HashMap<u64, HashSet<(u64, u64)>>>>,
+    global_counter: Arc<Mutex<u64>>,
+    send_instructions: Arc<Vec<UnboundedSender<Instruction>>>,
+    receive_for_client: UnboundedReceiver<AccountNotification>,
+}
+
+impl ClientHandler {
+    async fn run(&mut self) {
+        loop {
+            tokio::select! {
+                // User sent a request. Dispatch it to each of the underlying
+                // nodes. Use the same global counter for all of the nodes so
+                // that we can map it back to the originating request.
+                item = self.ws_stream.next() => {
+                    if let Some(item) = item {
+                        let data = item;
+                        if data.is_err() {
+                            // TODO: Error handling when reading from client is interrupted.
+                            return;
+                        }
+                        let data = data.unwrap().into_text();
+                        if data.is_err() {
+                            // TODO: Error handling when reading from client is interrupted.
+                            return;
+                        }
+                        let data = data.unwrap();
+                        if let Ok(instruction) = serde_json::from_str::<Instruction>(&data) {
+                            self.maybe_add_subscriber(&instruction, instruction.id);
+                        } else {
+                            let err = Error {
+                                jsonrpc: "2.0".to_string(),
+                                code: ErrorCode::InvalidRequest,
+                                message: data.to_string(),
+                            };
+                            let err = serde_json::to_string(&err).unwrap();
+                            self.ws_stream.send(Message::from(err)).await.unwrap();
+                        }
+                    }
+                }
+
+                // We received a notification that needs to be sent to
+                // the client. The multiplexer is responsible for
+                // setting the subscription correctly.
+                Some(notification) = self.receive_for_client.recv() => {
+                    self.ws_stream.send(Message::from(serde_json::to_string(&notification).unwrap())).await.unwrap();
+                }
+            }
+        }
+    }
+
+    /// Adds a subscriber if the pubkey isn't already a subscription. If it is a
+    /// subscription, there's no need to relay a new subscription. Instead, the
+    /// client will be relayed the existing subscription data.
+    fn maybe_add_subscriber(&mut self, instruction: &Instruction, client_instruction_id: u64) {
+        if let Some(pubkey) = instruction.get_pubkey() {
+            let mut pubkey_to_global_counter = self.pubkey_to_global_counter.lock().unwrap();
+            if let Some(global_counter) = pubkey_to_global_counter.get(&pubkey) {
+                // The pubkey is already subscribed to. Add this client to the list of
+                // clients we should broadcast to, but don't repeat the subscription.
+                let mut global_counter_to_subscription =
+                    self.global_counter_to_subscription.lock().unwrap();
+                if let Some(set) = global_counter_to_subscription.get_mut(global_counter) {
+                    set.insert((client_instruction_id, self.client_id));
+                }
+            } else {
+                // The pubkey isn't subscribed to.
+                let mut set = HashSet::new();
+                set.insert((client_instruction_id, self.client_id));
+                let global_counter = {
+                    let mut global_counter = self.global_counter.lock().unwrap();
+                    pubkey_to_global_counter.insert(pubkey.to_string(), *global_counter);
+                    *global_counter += 1;
+                    *global_counter - 1
+                };
+
+                {
+                    let mut global_counter_to_subscription =
+                        self.global_counter_to_subscription.lock().unwrap();
+                    global_counter_to_subscription.insert(global_counter, set);
+                }
+
+                // Dispatch to the underlying forwarders.
+                let mut instruction = instruction.clone();
+                instruction.id = global_counter;
+                for sender in self.send_instructions.iter() {
+                    sender.send(instruction.clone()).unwrap();
                 }
             }
         }

@@ -14,7 +14,6 @@ use url::Url;
 /// Manages communication with a single rpc endpoint.
 pub struct Forwarder {
     interface: Interface,
-    subscription_to_id: HashMap<u64, u64>,
 }
 
 enum Interface {
@@ -40,10 +39,7 @@ impl Forwarder {
             }
         };
 
-        Ok(Forwarder {
-            interface,
-            subscription_to_id: HashMap::new(),
-        })
+        Ok(Forwarder { interface })
     }
 
     /// Main event loop. A single task manages the websocket I/O. A task per
@@ -51,66 +47,23 @@ impl Forwarder {
     pub async fn run(
         &mut self,
         send_to_multiplexer: UnboundedSender<AccountNotification>,
-        mut receive_from_multiplexer: UnboundedReceiver<Instruction>,
+        receive_from_multiplexer: UnboundedReceiver<Instruction>,
     ) {
-        let mut interval = time::interval(std::time::Duration::from_secs(10));
-
         match &mut self.interface {
             &mut Interface::Rpc((ref client, ref url, ref poll_frequency)) => {
-                loop {
-                    // Process new subscriptions first, since these should be
-                    // relatively rare. Send the subscription as-is.
-                    if let Some(instruction) = receive_from_multiplexer.recv().await {
-                        // Regularly make synchronous requests and arbitrate with
-                        // the websocket. Note that the instruction id that was sent
-                        // by the multiplexer is the global counter that the
-                        // multiplexer expects to receive back. This means we can
-                        // send the instruction as-is since the rpc server will echo
-                        // back the id.
-                        Self::create_synchronous_subscription(
-                            client.clone(),
-                            url.clone(),
-                            &instruction,
-                            &send_to_multiplexer,
-                            &poll_frequency,
-                        );
-                    }
-                }
+                Self::rpc_event_loop(
+                    client,
+                    url,
+                    poll_frequency,
+                    send_to_multiplexer,
+                    receive_from_multiplexer,
+                )
+                .await;
             }
 
             &mut Interface::WebSocket(ref mut client) => {
-                loop {
-                    tokio::select! {
-                        // Process new subscriptions first, since these should be
-                        // relatively rare. Send the subscription as-is.
-                        Some(instruction) = receive_from_multiplexer.recv() => {
-                            client.send(Message::from(serde_json::to_string(&instruction).unwrap())).await.unwrap();
-                        }
-
-                        // If any data is available to be read, process it next.
-                        item = client.next() => {
-                            if let Some(item) = item {
-                                let data = item.unwrap().into_text().unwrap();
-                                if let Ok(reply) = serde_json::from_str::<SubscriptionReply>(&data) {
-                                    self.subscription_to_id.insert(reply.result, reply.id);
-                                } else if let Ok(reply) = serde_json::from_str::<AccountNotification>(&data) {
-                                    if let Some(id) = self.subscription_to_id.get(&reply.params.subscription) {
-                                        let mut reply = reply.clone();
-                                        reply.params.subscription = *id;
-                                        if send_to_multiplexer.send(reply).is_err() {
-                                            // TODO: Some error handling when we can't write to client.
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        // Send a keepalive message.
-                        _ = interval.tick() => {
-                            client.send(Message::from("{}")).await.unwrap();
-                        }
-                    }
-                }
+                Self::websocket_event_loop(client, send_to_multiplexer, receive_from_multiplexer)
+                    .await;
             }
         }
     }
@@ -166,5 +119,84 @@ impl Forwarder {
                 }
             }
         });
+    }
+
+    async fn rpc_event_loop(
+        client: &Arc<reqwest::Client>,
+        url: &Url,
+        poll_frequency: &std::time::Duration,
+        send_to_multiplexer: UnboundedSender<AccountNotification>,
+        mut receive_from_multiplexer: UnboundedReceiver<Instruction>,
+    ) {
+        loop {
+            // Process new subscriptions first, since these should be
+            // relatively rare. Send the subscription as-is.
+            if let Some(instruction) = receive_from_multiplexer.recv().await {
+                // Regularly make synchronous requests and arbitrate with
+                // the websocket. Note that the instruction id that was sent
+                // by the multiplexer is the global counter that the
+                // multiplexer expects to receive back. This means we can
+                // send the instruction as-is since the rpc server will echo
+                // back the id.
+                Self::create_synchronous_subscription(
+                    client.clone(),
+                    url.clone(),
+                    &instruction,
+                    &send_to_multiplexer,
+                    &poll_frequency,
+                );
+            }
+        }
+    }
+
+    async fn websocket_event_loop(
+        client: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        send_to_multiplexer: UnboundedSender<AccountNotification>,
+        mut receive_from_multiplexer: UnboundedReceiver<Instruction>,
+    ) {
+        let mut subscription_to_id = HashMap::new();
+        let mut interval = time::interval(std::time::Duration::from_secs(10));
+        loop {
+            tokio::select! {
+                // Process new subscriptions first, since these should be
+                // relatively rare. Send the subscription as-is.
+                Some(instruction) = receive_from_multiplexer.recv() => {
+                    client.send(Message::from(serde_json::to_string(&instruction).unwrap())).await.unwrap();
+                }
+
+                // If any data is available to be read, process it next.
+                item = client.next() => {
+                    Self::process_websocket_data(item, &mut subscription_to_id, send_to_multiplexer.clone());
+                }
+
+                // Send a keepalive message.
+                _ = interval.tick() => {
+                    client.send(Message::from("{}")).await.unwrap();
+                }
+            }
+        }
+    }
+
+    fn process_websocket_data(
+        item: Option<Result<Message>>,
+        subscription_to_id: &mut HashMap<u64, u64>,
+        send_to_multiplexer: UnboundedSender<AccountNotification>,
+    ) {
+        if let Some(item) = item {
+            let data = item.unwrap().into_text().unwrap();
+            if let Ok(reply) = serde_json::from_str::<SubscriptionReply>(&data) {
+                subscription_to_id.insert(reply.result, reply.id);
+            } else if let Ok(reply) = serde_json::from_str::<AccountNotification>(&data) {
+                if let Some(id) = subscription_to_id.get(&reply.params.subscription) {
+                    let mut reply = reply.clone();
+                    reply.params.subscription = *id;
+                    if send_to_multiplexer.send(reply).is_err() {
+                        // TODO: Some error handling when we can't write to client.
+                    }
+                }
+            }
+        }
     }
 }

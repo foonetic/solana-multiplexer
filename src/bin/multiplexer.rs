@@ -1,10 +1,10 @@
-use clap::Parser;
 /// Implements a simple Solana request multiplexer.
 ///
 /// The multiplexer dispatches account subscriptions to multiple endpoints and
 /// arbitrates responses to return the freshest data. WebSocket endpoints use
 /// the streaming API. HTTP endpoints use the JSON RPC API, polling at the
 /// specified frequency.
+use clap::Parser;
 use solana_multiplexer::{Endpoint, Multiplexer};
 use tokio_tungstenite::tungstenite::Result;
 use url::Url;

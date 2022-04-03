@@ -21,4 +21,6 @@ serde_json = "1.0"
 serde_repr = "0.1"
 tokio = {version = "1.17.0", features = ["full"]}
 tokio-tungstenite = {version = "0.17.1", features = ["native-tls"]}
+tracing = "0.1"
+tracing-subscriber = "0.2"
 url = "2.2.2"

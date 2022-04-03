@@ -55,8 +55,9 @@ pub struct NotificationContext {
 }
 
 /// Represents a websocket subscription response.
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct SubscriptionReply {
+    pub jsonrpc: String,
     pub result: u64,
     pub id: u64,
 }
@@ -96,4 +97,27 @@ impl Instruction {
             return None;
         }
     }
+}
+
+#[derive(Debug)]
+pub enum ClientToServer {
+    RemoveClient(u64),
+    Instruction(u64, Instruction),
+}
+
+#[derive(Debug)]
+pub enum ServerToClient {
+    AccountNotification(AccountNotification),
+    Error(Error),
+    SubscriptionReply(SubscriptionReply),
+}
+
+#[derive(Debug)]
+pub enum ServerToEndpoint {
+    Instruction(Instruction),
+}
+
+#[derive(Debug)]
+pub enum EndpointToServer {
+    AccountNotification(AccountNotification),
 }

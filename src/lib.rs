@@ -1,5 +1,9 @@
-mod forwarder;
+mod arbitrator;
+mod endpoint;
+mod listener;
 mod messages;
-pub mod multiplexer;
-
-pub use multiplexer::{Endpoint, Multiplexer};
+pub mod server;
+pub use {
+    endpoint::{spawn, EndpointConfig},
+    server::Server,
+};

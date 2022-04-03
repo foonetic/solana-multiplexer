@@ -5,7 +5,7 @@
 /// the streaming API. HTTP endpoints use the JSON RPC API, polling at the
 /// specified frequency.
 use clap::Parser;
-use solana_multiplexer::{Endpoint, Multiplexer};
+use solana_multiplexer::{EndpointConfig, Server};
 use tokio_tungstenite::tungstenite::Result;
 use url::Url;
 
@@ -23,14 +23,18 @@ struct Args {
     #[clap(long, default_value = "0.0.0:8900")]
     listen_address: String,
 
-    #[clap(long, default_value = "100")]
+    #[clap(long, default_value = "200")]
     poll_frequency_milliseconds: u64,
 }
 
 #[tokio::main(flavor = "current_thread")]
+#[tracing::instrument]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tracing_subscriber::fmt::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .init();
     let args = Args::parse();
-    let endpoints: Vec<Endpoint> = args
+    let endpoints: Vec<EndpointConfig> = args
         .endpoint
         .iter()
         .map(|s| {
@@ -41,9 +45,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
 
             if s.starts_with("ws") {
-                Endpoint::WebSocket(url)
+                EndpointConfig::PubSub(url)
             } else if s.starts_with("http") {
-                Endpoint::Rpc(
+                EndpointConfig::HTTP(
                     url,
                     std::time::Duration::from_millis(args.poll_frequency_milliseconds),
                 )
@@ -53,8 +57,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .collect();
 
-    let mut multiplexer = Multiplexer::new(&endpoints).await?;
-    multiplexer.listen(&args.listen_address).await;
+    let mut server = Server::new(&endpoints, &args.listen_address).await;
+    server.run().await;
 
     Ok(())
 }

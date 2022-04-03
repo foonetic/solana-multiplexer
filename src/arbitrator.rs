@@ -32,7 +32,11 @@ impl EndpointArbitrator {
     /// Listens to all endpoints. If the incoming data is an account
     /// notification, arbitrates and forwards to subscribing clients.
     pub async fn run(&mut self) {
-        while let Some(from_endpoint) = self.receive_from_endpoints.recv().await {
+        while self.run_once().await {}
+    }
+
+    async fn run_once(&mut self) -> bool {
+        if let Some(from_endpoint) = self.receive_from_endpoints.recv().await {
             match from_endpoint {
                 EndpointToServer::AccountNotification(notification) => {
                     self.on_notification(notification);
@@ -42,6 +46,9 @@ impl EndpointArbitrator {
                     error!(received_error = format!("{:?}", error).as_str());
                 }
             }
+            true
+        } else {
+            false
         }
     }
 
@@ -98,6 +105,89 @@ impl EndpointArbitrator {
                 // TODO: What should we do on channel failure?
                 error!(arbitrator_channel_failure = err.to_string().as_str());
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::mpsc::unbounded_channel;
+
+    fn setup() -> (
+        UnboundedReceiver<ServerToClient>,
+        UnboundedSender<EndpointToServer>,
+        EndpointArbitrator,
+    ) {
+        let (send_to_server, receive_from_endpoints) = unbounded_channel();
+        let mut client_senders = HashMap::new();
+        let mut subscriptions = HashMap::new();
+        let mut clients = HashSet::new();
+        clients.insert(5);
+        clients.insert(10);
+        subscriptions.insert(123, clients);
+
+        let (client_sender, client_receiver) = unbounded_channel();
+        client_senders.insert(5, client_sender);
+
+        let client_senders = Arc::new(Mutex::new(client_senders));
+        let subscriptions = Arc::new(Mutex::new(subscriptions));
+        let arbitrator = EndpointArbitrator::new(
+            receive_from_endpoints,
+            client_senders.clone(),
+            subscriptions.clone(),
+        );
+
+        (client_receiver, send_to_server, arbitrator)
+    }
+
+    fn notification(slot: i64) -> EndpointToServer {
+        EndpointToServer::AccountNotification(AccountNotification {
+            jsonrpc: "2.0".to_string(),
+            method: Method::accountNotification,
+            params: NotificationParams {
+                result: NotificationResult {
+                    context: NotificationContext { slot },
+                    value: serde_json::Value::Null,
+                },
+                subscription: 123,
+            },
+        })
+    }
+
+    #[tokio::test]
+    async fn arbitration() {
+        let (mut client_receiver, send_to_server, mut arbitrator) = setup();
+        send_to_server.send(notification(100)).unwrap();
+        arbitrator.run_once().await;
+
+        // Should be ignored
+        send_to_server.send(notification(100)).unwrap();
+        arbitrator.run_once().await;
+
+        // Should be ignored
+        send_to_server.send(notification(99)).unwrap();
+        arbitrator.run_once().await;
+
+        send_to_server.send(notification(200)).unwrap();
+        arbitrator.run_once().await;
+
+        let message = client_receiver.recv().await.unwrap();
+        if let ServerToClient::AccountNotification(message) = message {
+            assert_eq!(message.jsonrpc, "2.0");
+            assert_eq!(message.params.subscription, 123);
+            assert_eq!(message.params.result.context.slot, 100);
+        } else {
+            panic!("unexpected return type");
+        }
+
+        let message = client_receiver.recv().await.unwrap();
+        if let ServerToClient::AccountNotification(message) = message {
+            assert_eq!(message.jsonrpc, "2.0");
+            assert_eq!(message.params.subscription, 123);
+            assert_eq!(message.params.result.context.slot, 200);
+        } else {
+            panic!("unexpected return type");
         }
     }
 }

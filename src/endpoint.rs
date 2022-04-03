@@ -1,5 +1,5 @@
 use crate::messages::*;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{stream::SplitStream, SinkExt, StreamExt};
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
@@ -126,66 +126,17 @@ impl EndpointManager {
 
     /// Manages a PubSub endpoint.
     async fn run_pubsub(&mut self, websocket: WebSocketStream<MaybeTlsStream<TcpStream>>) {
+        let (mut to_endpoint, from_endpoint) = websocket.split();
         let id_to_subscription = Arc::new(Mutex::new(HashMap::new()));
-        let subscription_to_id = Arc::new(Mutex::new(HashMap::new()));
-        let (mut to_endpoint, mut from_endpoint) = websocket.split();
-        let send = self.send.clone();
 
+        let mut pubsub = PollPubSub {
+            from_endpoint,
+            subscription_to_id: HashMap::new(),
+            send: self.send.clone(),
+            id_to_subscription: id_to_subscription.clone(),
+        };
         tokio::spawn(async move {
-            while let Some(from_endpoint) = from_endpoint.next().await {
-                let data = from_endpoint;
-                if data.is_err() {
-                    error!(pubsub_read_failure = data.unwrap_err().to_string().as_str());
-                    continue;
-                }
-                let data = data.unwrap().into_text();
-                if data.is_err() {
-                    error!(pubsub_read_failure = data.unwrap_err().to_string().as_str());
-                    continue;
-                }
-                let data = data.unwrap();
-
-                if let Ok(mut account_notification) =
-                    serde_json::from_str::<AccountNotification>(&data)
-                {
-                    let id = {
-                        let subscription_to_id = subscription_to_id.lock().unwrap();
-                        subscription_to_id
-                            .get(&account_notification.params.subscription)
-                            .map(|v| *v)
-                    };
-
-                    if let Some(id) = id {
-                        account_notification.params.subscription = id;
-                        if let Err(err) =
-                            send.send(EndpointToServer::AccountNotification(account_notification))
-                        {
-                            error!(
-                                pubsub_to_server_channel_failure = err.to_string().as_str(),
-                                subscription_id = id
-                            );
-                        }
-                    }
-                } else if let Ok(subscription_reply) =
-                    serde_json::from_str::<SubscriptionReply>(&data)
-                {
-                    // Map to and from the subscription id returned by the
-                    // endpoint. This will be needed to translate replies into
-                    // the global id, and also to unsubscribe.
-                    {
-                        let mut id_to_subscription = id_to_subscription.lock().unwrap();
-                        id_to_subscription.insert(subscription_reply.id, subscription_reply.result);
-                    }
-                    {
-                        let mut subscription_to_id = subscription_to_id.lock().unwrap();
-                        subscription_to_id.insert(subscription_reply.result, subscription_reply.id);
-                    }
-                    info!(
-                        new_pubsub_global_id = subscription_reply.id,
-                        new_pubsub_subscription_id = subscription_reply.result
-                    );
-                }
-            }
+            pubsub.run().await;
         });
 
         while let Some(from_server) = self.receive.recv().await {
@@ -201,6 +152,73 @@ impl EndpointManager {
                     }
                     _ => {}
                 },
+            }
+        }
+    }
+}
+
+/// Polls messages from the PubSub endpoint and passes them to the server as
+/// needed. Subscription replies do not need to be passes back to the server
+/// since the endpoint is responsible for managing those subscriptions. The
+/// server will always reply with the logical global subscription id rather than
+/// each endpoint's specific subscription id.
+struct PollPubSub {
+    from_endpoint: SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>,
+    subscription_to_id: HashMap<u64, u64>,
+    send: UnboundedSender<EndpointToServer>,
+    id_to_subscription: Arc<Mutex<HashMap<u64, u64>>>,
+}
+
+impl PollPubSub {
+    async fn run(&mut self) {
+        while let Some(from_endpoint) = self.from_endpoint.next().await {
+            let data = from_endpoint;
+            if data.is_err() {
+                error!(pubsub_read_failure = data.unwrap_err().to_string().as_str());
+                continue;
+            }
+            let data = data.unwrap().into_text();
+            if data.is_err() {
+                error!(pubsub_read_failure = data.unwrap_err().to_string().as_str());
+                continue;
+            }
+            let data = data.unwrap();
+
+            if let Ok(mut account_notification) = serde_json::from_str::<AccountNotification>(&data)
+            {
+                let id = {
+                    self.subscription_to_id
+                        .get(&account_notification.params.subscription)
+                        .map(|v| *v)
+                };
+
+                if let Some(id) = id {
+                    account_notification.params.subscription = id;
+                    if let Err(err) = self
+                        .send
+                        .send(EndpointToServer::AccountNotification(account_notification))
+                    {
+                        error!(
+                            pubsub_to_server_channel_failure = err.to_string().as_str(),
+                            subscription_id = id
+                        );
+                    }
+                }
+            } else if let Ok(subscription_reply) = serde_json::from_str::<SubscriptionReply>(&data)
+            {
+                // Map to and from the subscription id returned by the
+                // endpoint. This will be needed to translate replies into
+                // the global id, and also to unsubscribe.
+                {
+                    let mut id_to_subscription = self.id_to_subscription.lock().unwrap();
+                    id_to_subscription.insert(subscription_reply.id, subscription_reply.result);
+                }
+                self.subscription_to_id
+                    .insert(subscription_reply.result, subscription_reply.id);
+                info!(
+                    new_pubsub_global_id = subscription_reply.id,
+                    new_pubsub_subscription_id = subscription_reply.result
+                );
             }
         }
     }

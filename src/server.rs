@@ -105,86 +105,109 @@ impl Server {
     fn process_instruction(&mut self, client: u64, instruction: &Instruction) {
         match instruction.method {
             Method::accountSubscribe => {
-                let pubkey = instruction.get_pubkey();
-                let original_id = instruction.id;
-
-                // Check that the instruction includes a PubKey.
-                if let Some(pubkey) = pubkey {
-                    // If the subscription for that PubKey already exists, then
-                    // return the current subscription. Otherwise, add a new
-                    // subscription.
-                    let subscription =
-                        if let Some(subscription) = self.pubkey_to_subscription.get(&pubkey) {
-                            *subscription
-                        } else {
-                            let subscription = self.next_subscription;
-                            self.pubkey_to_subscription.insert(pubkey, subscription);
-                            self.next_subscription += 1;
-                            let mut instruction = instruction.clone();
-                            instruction.id = subscription;
-                            for endpoint in self.endpoints.iter() {
-                                // TODO: How should we handle channel write failures?
-                                if let Err(err) = endpoint
-                                    .send(ServerToEndpoint::Instruction(instruction.clone()))
-                                {
-                                    error!(endpoint_channel_failure = err.to_string().as_str());
-                                }
-                            }
-                            subscription
-                        };
-
-                    let got = {
-                        let clients = self.client_senders.lock().unwrap();
-                        clients.get(&client).map(|v| v.clone())
-                    };
-                    if let Some(sender) = got {
-                        // Add the client to the current list of subscribers.
-                        {
-                            let mut subscriptions = self.subscriptions.lock().unwrap();
-                            subscriptions
-                                .entry(subscription)
-                                .or_insert(HashSet::new())
-                                .insert(client);
-                        }
-                        info!(client_id = client, subscription_id = subscription);
-
-                        // TODO: How should we handle channel write failures?
-                        if let Err(err) =
-                            sender.send(ServerToClient::SubscriptionReply(SubscriptionReply {
-                                jsonrpc: "2.0".to_string(),
-                                result: subscription,
-                                id: original_id,
-                            }))
-                        {
-                            error!(
-                                client_id = client,
-                                subscription_reply_channel_error = err.to_string().as_str()
-                            );
-                        }
-                    }
-                } else {
-                    // Send an error message back to the client.
-                    let got = {
-                        let clients = self.client_senders.lock().unwrap();
-                        clients.get(&client).map(|v| v.clone())
-                    };
-                    if let Some(sender) = got {
-                        // TODO: How should we handle channel write failures?
-                        if let Err(err) = sender.send(ServerToClient::Error(Error {
-                            jsonrpc: "2.0".to_string(),
-                            code: ErrorCode::InvalidParams,
-                            message: "unable to parse PublicKey".to_string(),
-                        })) {
-                            error!(
-                                client_id = client,
-                                subscription_reply_channel_error = err.to_string().as_str()
-                            );
-                        }
-                    }
-                }
+                self.process_account_subscribe(client, instruction);
             }
 
             _ => {}
+        }
+    }
+
+    fn process_account_subscribe(&mut self, client: u64, instruction: &Instruction) {
+        let pubkey = instruction.get_pubkey();
+
+        // Check that the instruction includes a PubKey.
+        if let Some(pubkey) = pubkey {
+            self.process_account_subscribe_with_pubkey(client, instruction, pubkey);
+        } else {
+            self.send_pubkey_missing_error(client);
+        }
+    }
+
+    fn send_pubkey_missing_error(&mut self, client: u64) {
+        // Send an error message back to the client.
+        let got = {
+            let clients = self.client_senders.lock().unwrap();
+            clients.get(&client).map(|v| v.clone())
+        };
+        if let Some(sender) = got {
+            // TODO: How should we handle channel write failures?
+            if let Err(err) = sender.send(ServerToClient::Error(Error {
+                jsonrpc: "2.0".to_string(),
+                code: ErrorCode::InvalidParams,
+                message: "unable to parse PublicKey".to_string(),
+            })) {
+                error!(
+                    client_id = client,
+                    subscription_reply_channel_error = err.to_string().as_str()
+                );
+            }
+        }
+    }
+
+    fn process_account_subscribe_with_pubkey(
+        &mut self,
+        client: u64,
+        instruction: &Instruction,
+        pubkey: String,
+    ) {
+        // If the subscription for that PubKey already exists, then
+        // return the current subscription. Otherwise, add a new
+        // subscription.
+        let subscription = if let Some(subscription) = self.pubkey_to_subscription.get(&pubkey) {
+            *subscription
+        } else {
+            self.process_new_pubkey_subscription(instruction, pubkey)
+        };
+
+        self.add_subscriber(client, subscription, instruction.id)
+    }
+
+    fn process_new_pubkey_subscription(
+        &mut self,
+        instruction: &Instruction,
+        pubkey: String,
+    ) -> u64 {
+        let subscription = self.next_subscription;
+        self.pubkey_to_subscription.insert(pubkey, subscription);
+        self.next_subscription += 1;
+        let mut instruction = instruction.clone();
+        instruction.id = subscription;
+        for endpoint in self.endpoints.iter() {
+            // TODO: How should we handle channel write failures?
+            if let Err(err) = endpoint.send(ServerToEndpoint::Instruction(instruction.clone())) {
+                error!(endpoint_channel_failure = err.to_string().as_str());
+            }
+        }
+        subscription
+    }
+
+    fn add_subscriber(&mut self, client: u64, subscription: u64, original_id: u64) {
+        let got = {
+            let clients = self.client_senders.lock().unwrap();
+            clients.get(&client).map(|v| v.clone())
+        };
+        if let Some(sender) = got {
+            // Add the client to the current list of subscribers.
+            {
+                let mut subscriptions = self.subscriptions.lock().unwrap();
+                subscriptions
+                    .entry(subscription)
+                    .or_insert(HashSet::new())
+                    .insert(client);
+            }
+            info!(client_id = client, subscription_id = subscription);
+
+            // TODO: How should we handle channel write failures?
+            if let Err(err) = sender.send(ServerToClient::SubscriptionReply(SubscriptionReply {
+                jsonrpc: "2.0".to_string(),
+                result: subscription,
+                id: original_id,
+            })) {
+                error!(
+                    client_id = client,
+                    subscription_reply_channel_error = err.to_string().as_str()
+                );
+            }
         }
     }
 }

@@ -16,6 +16,15 @@ pub struct Error {
     pub jsonrpc: String,
     pub code: ErrorCode,
     pub message: String,
+    pub id: u64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct InvalidRequestError {
+    pub jsonrpc: String,
+    pub code: ErrorCode,
+    pub message: String,
+    pub id: i8,
 }
 
 /// A websocket account notification.
@@ -109,6 +118,7 @@ pub enum ClientToServer {
 pub enum ServerToClient {
     AccountNotification(AccountNotification),
     Error(Error),
+    InvalidRequestError(InvalidRequestError),
     SubscriptionReply(SubscriptionReply),
 }
 

@@ -108,7 +108,12 @@ impl Server {
                 self.process_account_subscribe(client, instruction);
             }
 
-            _ => {}
+            _ => self.send_error(
+                client,
+                ErrorCode::InvalidRequest,
+                "unsupported request".to_string(),
+                instruction.id,
+            ),
         }
     }
 
@@ -119,11 +124,11 @@ impl Server {
         if let Some(pubkey) = pubkey {
             self.process_account_subscribe_with_pubkey(client, instruction, pubkey);
         } else {
-            self.send_pubkey_missing_error(client);
+            self.send_pubkey_missing_error(client, instruction.id);
         }
     }
 
-    fn send_pubkey_missing_error(&mut self, client: u64) {
+    fn send_error(&mut self, client: u64, code: ErrorCode, message: String, id: u64) {
         // Send an error message back to the client.
         let got = {
             let clients = self.client_senders.lock().unwrap();
@@ -133,8 +138,9 @@ impl Server {
             // TODO: How should we handle channel write failures?
             if let Err(err) = sender.send(ServerToClient::Error(Error {
                 jsonrpc: "2.0".to_string(),
-                code: ErrorCode::InvalidParams,
-                message: "unable to parse PublicKey".to_string(),
+                code,
+                message,
+                id,
             })) {
                 error!(
                     client_id = client,
@@ -142,6 +148,15 @@ impl Server {
                 );
             }
         }
+    }
+
+    fn send_pubkey_missing_error(&mut self, client: u64, id: u64) {
+        self.send_error(
+            client,
+            ErrorCode::InvalidParams,
+            "unable to parse PublicKey".to_string(),
+            id,
+        );
     }
 
     fn process_account_subscribe_with_pubkey(

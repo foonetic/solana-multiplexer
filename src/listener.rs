@@ -11,6 +11,8 @@ use tokio::{
 use tokio_tungstenite::{tungstenite::Message, WebSocketStream};
 use tracing::{error, info};
 
+/// Listens to incoming WebSocket connections and spawns ClientManager instances
+/// to manage the connection.
 pub struct PortListener {
     next_client_id: u64,
     clients: Arc<Mutex<HashMap<u64, UnboundedSender<ServerToClient>>>>,
@@ -53,6 +55,8 @@ impl PortListener {
     }
 }
 
+/// Manages I/O between the WebSocket server and the client. This code must be
+/// modified if our server must support additional instruction schemas.
 struct ClientManager {
     id: u64,
     send_to_server: UnboundedSender<ClientToServer>,
@@ -137,6 +141,8 @@ impl ClientManager {
     }
 }
 
+/// Forwards server notifications to the client. This must be changed if we want
+/// to pass back additional message types.
 struct SendToClient {
     id: u64,
     receive_from_server: UnboundedReceiver<ServerToClient>,

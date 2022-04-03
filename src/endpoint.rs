@@ -184,43 +184,51 @@ impl PollPubSub {
             }
             let data = data.unwrap();
 
-            if let Ok(mut account_notification) = serde_json::from_str::<AccountNotification>(&data)
-            {
-                let id = {
-                    self.subscription_to_id
-                        .get(&account_notification.params.subscription)
-                        .map(|v| *v)
-                };
-
-                if let Some(id) = id {
-                    account_notification.params.subscription = id;
-                    if let Err(err) = self
-                        .send
-                        .send(EndpointToServer::AccountNotification(account_notification))
-                    {
-                        error!(
-                            pubsub_to_server_channel_failure = err.to_string().as_str(),
-                            subscription_id = id
-                        );
-                    }
-                }
+            if let Ok(account_notification) = serde_json::from_str::<AccountNotification>(&data) {
+                self.on_account_notification(&account_notification);
             } else if let Ok(subscription_reply) = serde_json::from_str::<SubscriptionReply>(&data)
             {
-                // Map to and from the subscription id returned by the
-                // endpoint. This will be needed to translate replies into
-                // the global id, and also to unsubscribe.
-                {
-                    let mut id_to_subscription = self.id_to_subscription.lock().unwrap();
-                    id_to_subscription.insert(subscription_reply.id, subscription_reply.result);
-                }
-                self.subscription_to_id
-                    .insert(subscription_reply.result, subscription_reply.id);
-                info!(
-                    new_pubsub_global_id = subscription_reply.id,
-                    new_pubsub_subscription_id = subscription_reply.result
+                self.on_subscription_reply(&subscription_reply);
+            }
+        }
+    }
+
+    fn on_account_notification(&mut self, account_notification: &AccountNotification) {
+        let id = {
+            self.subscription_to_id
+                .get(&account_notification.params.subscription)
+                .map(|v| *v)
+        };
+
+        if let Some(id) = id {
+            let mut account_notification = account_notification.clone();
+            account_notification.params.subscription = id;
+            if let Err(err) = self
+                .send
+                .send(EndpointToServer::AccountNotification(account_notification))
+            {
+                error!(
+                    pubsub_to_server_channel_failure = err.to_string().as_str(),
+                    subscription_id = id
                 );
             }
         }
+    }
+
+    fn on_subscription_reply(&mut self, subscription_reply: &SubscriptionReply) {
+        // Map to and from the subscription id returned by the
+        // endpoint. This will be needed to translate replies into
+        // the global id, and also to unsubscribe.
+        {
+            let mut id_to_subscription = self.id_to_subscription.lock().unwrap();
+            id_to_subscription.insert(subscription_reply.id, subscription_reply.result);
+        }
+        self.subscription_to_id
+            .insert(subscription_reply.result, subscription_reply.id);
+        info!(
+            new_pubsub_global_id = subscription_reply.id,
+            new_pubsub_subscription_id = subscription_reply.result
+        );
     }
 }
 

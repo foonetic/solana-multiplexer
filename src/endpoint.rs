@@ -1,5 +1,8 @@
 use crate::messages::*;
-use futures_util::{stream::SplitStream, SinkExt, StreamExt};
+use futures_util::{
+    stream::{SplitSink, SplitStream},
+    SinkExt, StreamExt,
+};
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
@@ -118,7 +121,23 @@ impl EndpointManager {
                             endpoint.run().await;
                         });
                     }
-                    _ => {}
+
+                    Method::accountUnsubscribe => {
+                        if let Some(unsubscribe) = unsubscribe_by_id.get(&instruction.id) {
+                            let mut val = unsubscribe.lock().unwrap();
+                            *val = true;
+                        }
+                        info!(http_unsubscribe_global_id = instruction.id);
+                        unsubscribe_by_id.remove(&instruction.id);
+                    }
+
+                    _ => {
+                        self.send_error(
+                            ErrorCode::InvalidRequest,
+                            "unknown instruction".to_string(),
+                            instruction.id,
+                        );
+                    }
                 },
             }
         }
@@ -127,11 +146,12 @@ impl EndpointManager {
     /// Manages a PubSub endpoint.
     async fn run_pubsub(&mut self, websocket: WebSocketStream<MaybeTlsStream<TcpStream>>) {
         let (mut to_endpoint, from_endpoint) = websocket.split();
+        let subscription_to_id = Arc::new(Mutex::new(HashMap::new()));
         let id_to_subscription = Arc::new(Mutex::new(HashMap::new()));
 
         let mut pubsub = PollPubSub {
             from_endpoint,
-            subscription_to_id: HashMap::new(),
+            subscription_to_id: subscription_to_id.clone(),
             send: self.send.clone(),
             id_to_subscription: id_to_subscription.clone(),
         };
@@ -139,20 +159,115 @@ impl EndpointManager {
             pubsub.run().await;
         });
 
-        while let Some(from_server) = self.receive.recv().await {
-            match from_server {
-                ServerToEndpoint::Instruction(instruction) => match instruction.method {
-                    Method::accountSubscribe => {
-                        let instruction = serde_json::to_string(&instruction).unwrap();
-                        if let Err(err) = to_endpoint.send(Message::from(instruction)).await {
-                            error!(
-                                instruction_to_endpoint_channel_failure = err.to_string().as_str()
-                            );
-                        }
-                    }
-                    _ => {}
-                },
+        let mut interval = time::interval(Duration::from_secs(30));
+        loop {
+            tokio::select! {
+                Some(from_server) = self.receive.recv() => {
+                    self.on_server_message(
+                        from_server,
+                        &mut to_endpoint,
+                        id_to_subscription.clone(),
+                        subscription_to_id.clone()
+                    ).await;
+                }
+
+                _ = interval.tick() => {
+                    self.send_keepalive(&mut to_endpoint).await;
+                }
             }
+        }
+    }
+
+    async fn send_keepalive(
+        &mut self,
+        to_endpoint: &mut SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>,
+    ) {
+        let instruction = "";
+        if let Err(err) = to_endpoint.send(Message::from(instruction)).await {
+            error!(instruction_to_endpoint_channel_failure = err.to_string().as_str());
+        }
+    }
+
+    async fn on_server_message(
+        &mut self,
+        from_server: ServerToEndpoint,
+        to_endpoint: &mut SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>,
+        id_to_subscription: Arc<Mutex<HashMap<i64, i64>>>,
+        subscription_to_id: Arc<Mutex<HashMap<i64, i64>>>,
+    ) {
+        match from_server {
+            ServerToEndpoint::Instruction(instruction) => match instruction.method {
+                Method::accountSubscribe => {
+                    let instruction = serde_json::to_string(&instruction).unwrap();
+                    if let Err(err) = to_endpoint.send(Message::from(instruction)).await {
+                        error!(instruction_to_endpoint_channel_failure = err.to_string().as_str());
+                    }
+                }
+
+                Method::accountUnsubscribe => {
+                    if let Some(id) = instruction.get_integer() {
+                        let unsubscribe = {
+                            let id_to_subscription = id_to_subscription.lock().unwrap();
+                            id_to_subscription.get(&id).map(|v| *v)
+                        };
+                        if let Some(unsubscribe) = unsubscribe {
+                            let mut instruction = instruction.clone();
+                            instruction.set_integer(unsubscribe);
+
+                            info!(
+                                pubsub_unsubscribe_request_id = instruction.id,
+                                subscription = unsubscribe,
+                                global_id = id
+                            );
+                            let instruction = serde_json::to_string(&instruction).unwrap();
+
+                            if let Err(err) = to_endpoint.send(Message::from(instruction)).await {
+                                error!(
+                                    instruction_to_endpoint_channel_failure =
+                                        err.to_string().as_str()
+                                );
+                            }
+
+                            // Remove account tracking.
+                            {
+                                let mut id_to_subscription = id_to_subscription.lock().unwrap();
+                                let mut subscription_to_id = subscription_to_id.lock().unwrap();
+                                id_to_subscription.remove(&id);
+                                subscription_to_id.remove(&unsubscribe);
+                            }
+                        }
+                    } else {
+                        self.send_error(
+                            ErrorCode::InvalidRequest,
+                            "invalid unsubscribe request".to_string(),
+                            instruction.id,
+                        );
+                    }
+                }
+
+                _ => {
+                    self.send_error(
+                        ErrorCode::InvalidRequest,
+                        "unknown instruction".to_string(),
+                        instruction.id,
+                    );
+                }
+            },
+        }
+    }
+
+    fn send_error(&mut self, code: ErrorCode, message: String, id: i64) {
+        // TODO: How should we handle channel write failures?
+        if let Err(err) = self.send.send(EndpointToServer::Error(Error {
+            jsonrpc: "2.0".to_string(),
+            code,
+            message,
+            id,
+        })) {
+            error!(
+                request_id = id,
+                subscription_reply_channel_error = err.to_string().as_str()
+            );
         }
     }
 }
@@ -164,9 +279,9 @@ impl EndpointManager {
 /// each endpoint's specific subscription id.
 struct PollPubSub {
     from_endpoint: SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>,
-    subscription_to_id: HashMap<u64, u64>,
+    subscription_to_id: Arc<Mutex<HashMap<i64, i64>>>,
     send: UnboundedSender<EndpointToServer>,
-    id_to_subscription: Arc<Mutex<HashMap<u64, u64>>>,
+    id_to_subscription: Arc<Mutex<HashMap<i64, i64>>>,
 }
 
 impl PollPubSub {
@@ -189,13 +304,20 @@ impl PollPubSub {
             } else if let Ok(subscription_reply) = serde_json::from_str::<SubscriptionReply>(&data)
             {
                 self.on_subscription_reply(&subscription_reply);
+            } else if let Ok(unsubscribe_reply) = serde_json::from_str::<UnsubscribeReply>(&data) {
+                self.on_unsubscribe(&unsubscribe_reply);
             }
         }
     }
 
+    fn on_unsubscribe(&mut self, unsubscribe: &UnsubscribeReply) {
+        info!(pubsub_unsubscribe_request_id_acknowledged = unsubscribe.id);
+    }
+
     fn on_account_notification(&mut self, account_notification: &AccountNotification) {
         let id = {
-            self.subscription_to_id
+            let subscription_to_id = self.subscription_to_id.lock().unwrap();
+            subscription_to_id
                 .get(&account_notification.params.subscription)
                 .map(|v| *v)
         };
@@ -223,8 +345,10 @@ impl PollPubSub {
             let mut id_to_subscription = self.id_to_subscription.lock().unwrap();
             id_to_subscription.insert(subscription_reply.id, subscription_reply.result);
         }
-        self.subscription_to_id
-            .insert(subscription_reply.result, subscription_reply.id);
+        {
+            let mut subscription_to_id = self.subscription_to_id.lock().unwrap();
+            subscription_to_id.insert(subscription_reply.result, subscription_reply.id);
+        }
         info!(
             new_pubsub_global_id = subscription_reply.id,
             new_pubsub_subscription_id = subscription_reply.result

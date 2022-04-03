@@ -125,16 +125,13 @@ impl ClientManager {
                     return;
                 }
             } else {
-                let err = InvalidRequestError {
+                let err = Error {
                     jsonrpc: "2.0".to_string(),
                     code: ErrorCode::InvalidRequest,
                     message: data.to_string(),
                     id: -1,
                 };
-                if let Err(err) = self
-                    .send_to_client
-                    .send(ServerToClient::InvalidRequestError(err))
-                {
+                if let Err(err) = self.send_to_client.send(ServerToClient::Error(err)) {
                     error!(
                         client_id = self.id,
                         channel_send_failure = err.to_string().as_str()
@@ -158,10 +155,6 @@ impl SendToClient {
         while let Some(from_server) = self.receive_from_server.recv().await {
             let result = match from_server {
                 ServerToClient::AccountNotification(msg) => {
-                    let msg = serde_json::to_string(&msg).unwrap();
-                    self.send_to_client.send(Message::from(msg)).await
-                }
-                ServerToClient::InvalidRequestError(msg) => {
                     let msg = serde_json::to_string(&msg).unwrap();
                     self.send_to_client.send(Message::from(msg)).await
                 }

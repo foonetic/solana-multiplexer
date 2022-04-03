@@ -10,16 +10,16 @@ use tracing::{error, info};
 /// observed slot.
 pub struct EndpointArbitrator {
     receive_from_endpoints: UnboundedReceiver<EndpointToServer>,
-    latest_slot_by_subscription: HashMap<u64, u64>,
+    latest_slot_by_subscription: HashMap<i64, i64>,
     client_senders: Arc<Mutex<HashMap<u64, UnboundedSender<ServerToClient>>>>,
-    subscriptions: Arc<Mutex<HashMap<u64, HashSet<u64>>>>,
+    subscriptions: Arc<Mutex<HashMap<i64, HashSet<u64>>>>,
 }
 
 impl EndpointArbitrator {
     pub fn new(
         receive_from_endpoints: UnboundedReceiver<EndpointToServer>,
         client_senders: Arc<Mutex<HashMap<u64, UnboundedSender<ServerToClient>>>>,
-        subscriptions: Arc<Mutex<HashMap<u64, HashSet<u64>>>>,
+        subscriptions: Arc<Mutex<HashMap<i64, HashSet<u64>>>>,
     ) -> Self {
         Self {
             receive_from_endpoints,
@@ -36,6 +36,10 @@ impl EndpointArbitrator {
             match from_endpoint {
                 EndpointToServer::AccountNotification(notification) => {
                     self.on_notification(notification);
+                }
+
+                EndpointToServer::Error(error) => {
+                    error!(received_error = format!("{:?}", error).as_str());
                 }
             }
         }

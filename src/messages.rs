@@ -16,15 +16,7 @@ pub struct Error {
     pub jsonrpc: String,
     pub code: ErrorCode,
     pub message: String,
-    pub id: u64,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct InvalidRequestError {
-    pub jsonrpc: String,
-    pub code: ErrorCode,
-    pub message: String,
-    pub id: i8,
+    pub id: i64,
 }
 
 /// A websocket account notification.
@@ -40,14 +32,14 @@ pub struct AccountNotification {
 pub struct AccountInfo {
     pub jsonrpc: String,
     pub result: NotificationResult,
-    pub id: u64,
+    pub id: i64,
 }
 
 /// Internal parameters within an account notification.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct NotificationParams {
     pub result: NotificationResult,
-    pub subscription: u64,
+    pub subscription: i64,
 }
 
 /// Internal result within an account params.
@@ -60,21 +52,29 @@ pub struct NotificationResult {
 /// Internal context within an account result.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct NotificationContext {
-    pub slot: u64,
+    pub slot: i64,
 }
 
 /// Represents a websocket subscription response.
 #[derive(Serialize, Deserialize, Debug)]
 pub struct SubscriptionReply {
     pub jsonrpc: String,
-    pub result: u64,
-    pub id: u64,
+    pub result: i64,
+    pub id: i64,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct UnsubscribeReply {
+    pub jsonrpc: String,
+    pub result: bool,
+    pub id: i64,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[allow(non_camel_case_types)]
 pub enum Method {
     accountSubscribe,
+    accountUnsubscribe,
     getAccountInfo,
     accountNotification,
 }
@@ -83,7 +83,7 @@ pub enum Method {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Instruction {
     pub jsonrpc: String,
-    pub id: u64,
+    pub id: i64,
     pub method: Method,
     pub params: serde_json::Value,
 }
@@ -106,6 +106,30 @@ impl Instruction {
             return None;
         }
     }
+
+    /// Returns the integer parameter of the instruction, assumed to be the
+    /// first function parameter.
+    pub fn get_integer(&self) -> Option<i64> {
+        if let serde_json::Value::Array(arr) = &self.params {
+            if arr.len() > 0 {
+                if let serde_json::Value::Number(num) = &arr[0] {
+                    return num.as_i64();
+                } else {
+                    return None;
+                }
+            } else {
+                return None;
+            }
+        } else {
+            return None;
+        }
+    }
+
+    pub fn set_integer(&mut self, value: i64) {
+        self.params = serde_json::Value::Array(vec![serde_json::Value::Number(
+            serde_json::Number::from(value),
+        )]);
+    }
 }
 
 #[derive(Debug)]
@@ -118,7 +142,6 @@ pub enum ClientToServer {
 pub enum ServerToClient {
     AccountNotification(AccountNotification),
     Error(Error),
-    InvalidRequestError(InvalidRequestError),
     SubscriptionReply(SubscriptionReply),
 }
 
@@ -130,4 +153,5 @@ pub enum ServerToEndpoint {
 #[derive(Debug)]
 pub enum EndpointToServer {
     AccountNotification(AccountNotification),
+    Error(Error),
 }

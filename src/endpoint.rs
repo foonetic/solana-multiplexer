@@ -27,12 +27,6 @@ pub enum EndpointConfig {
     PubSub(Url),
 }
 
-/// Internal representation of the endpoint.
-enum EndpointProtocol {
-    HTTP(Arc<reqwest::Client>, Url, Duration),
-    PubSub(WebSocketStream<MaybeTlsStream<TcpStream>>),
-}
-
 /// Receives instructions from the server for a single endpoint. Sends data back
 /// to the server to be arbitrated.
 pub struct EndpointManager {
@@ -56,138 +50,129 @@ pub async fn spawn(
     let mut endpoints = Vec::new();
     for endpoint in config.iter() {
         let (server_to_endpoint, receive_from_server) = unbounded_channel();
-        let mut endpoint_manager = EndpointManager {
+        let endpoint_manager = EndpointManager {
             send: endpoint_to_server.clone(),
             receive: receive_from_server,
         };
 
-        let protocol = match endpoint {
+        match endpoint {
             EndpointConfig::HTTP(url, frequency) => {
+                let (url, frequency, http_client) =
+                    (url.clone(), frequency.clone(), http_client.clone());
                 info!(new_http_endpoint = url.as_str());
-                EndpointProtocol::HTTP(http_client.clone(), url.clone(), frequency.clone())
+                tokio::spawn(async move {
+                    run_http(endpoint_manager, http_client.clone(), url, frequency).await;
+                });
             }
 
             EndpointConfig::PubSub(url) => {
                 info!(new_pubsub_endpoint = url.as_str());
                 let (ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
-                EndpointProtocol::PubSub(ws)
+                tokio::spawn(async move {
+                    run_pubsub(endpoint_manager, ws).await;
+                });
             }
-        };
-
-        tokio::spawn(async move {
-            endpoint_manager.run(protocol).await;
-        });
+        }
 
         endpoints.push(server_to_endpoint);
     }
     (receive_from_endpoints, endpoints)
 }
 
+/// Manages an HTTP endpoint.
+async fn run_http(
+    mut manager: EndpointManager,
+    client: Arc<reqwest::Client>,
+    url: Url,
+    frequency: Duration,
+) {
+    let mut unsubscribe_by_id = HashMap::new();
+    while let Some(from_server) = manager.receive.recv().await {
+        match from_server {
+            ServerToEndpoint::Instruction(instruction) => match instruction.method {
+                Method::accountSubscribe => {
+                    let unsubscribe = Arc::new(Mutex::new(false));
+                    unsubscribe_by_id.insert(instruction.id, unsubscribe.clone());
+                    let mut instruction = instruction.clone();
+                    instruction.method = Method::getAccountInfo;
+                    info!(new_http_subscription_id = instruction.id);
+                    let instruction = serde_json::to_string(&instruction).unwrap();
+                    let mut endpoint = PollHTTP {
+                        client: client.clone(),
+                        url: url.clone(),
+                        frequency: frequency.clone(),
+                        instruction: instruction,
+                        unsubscribe: unsubscribe.clone(),
+                        send: manager.send.clone(),
+                    };
+                    tokio::spawn(async move {
+                        endpoint.run().await;
+                    });
+                }
+
+                Method::accountUnsubscribe => {
+                    if let Some(unsubscribe) = unsubscribe_by_id.get(&instruction.id) {
+                        let mut val = unsubscribe.lock().unwrap();
+                        *val = true;
+                    }
+                    info!(http_unsubscribe_global_id = instruction.id);
+                    unsubscribe_by_id.remove(&instruction.id);
+                }
+
+                _ => {
+                    manager.send_error(
+                        ErrorCode::InvalidRequest,
+                        "unknown instruction".to_string(),
+                        instruction.id,
+                    );
+                }
+            },
+        }
+    }
+}
+
+/// Manages a PubSub endpoint.
+async fn run_pubsub(
+    mut endpoint: EndpointManager,
+    websocket: WebSocketStream<MaybeTlsStream<TcpStream>>,
+) {
+    let (mut to_endpoint, from_endpoint) = websocket.split();
+    let subscription_to_id = Arc::new(Mutex::new(HashMap::new()));
+    let id_to_subscription = Arc::new(Mutex::new(HashMap::new()));
+
+    let mut pubsub = PollPubSub {
+        from_endpoint,
+        subscription_to_id: subscription_to_id.clone(),
+        send: endpoint.send.clone(),
+        id_to_subscription: id_to_subscription.clone(),
+    };
+    tokio::spawn(async move {
+        pubsub.run().await;
+    });
+
+    let mut interval = time::interval(Duration::from_secs(30));
+    loop {
+        tokio::select! {
+            Some(from_server) = endpoint.receive.recv() => {
+                endpoint.on_server_message(
+                    from_server,
+                    &mut to_endpoint,
+                    id_to_subscription.clone(),
+                    subscription_to_id.clone()
+                ).await;
+            }
+
+            _ = interval.tick() => {
+                let instruction = "";
+                if let Err(err) = to_endpoint.send(Message::from(instruction)).await {
+                    error!(instruction_to_endpoint_channel_failure = err.to_string().as_str());
+                }
+            }
+        }
+    }
+}
+
 impl EndpointManager {
-    /// Manages either an HTTP or PubSub endpoint.
-    async fn run(&mut self, protocol: EndpointProtocol) {
-        match protocol {
-            EndpointProtocol::HTTP(client, url, frequency) => {
-                self.run_http(client, url, frequency).await;
-            }
-            EndpointProtocol::PubSub(websocket) => {
-                self.run_pubsub(websocket).await;
-            }
-        };
-    }
-
-    /// Manages an HTTP endpoint.
-    async fn run_http(&mut self, client: Arc<reqwest::Client>, url: Url, frequency: Duration) {
-        let mut unsubscribe_by_id = HashMap::new();
-        while let Some(from_server) = self.receive.recv().await {
-            match from_server {
-                ServerToEndpoint::Instruction(instruction) => match instruction.method {
-                    Method::accountSubscribe => {
-                        let unsubscribe = Arc::new(Mutex::new(false));
-                        unsubscribe_by_id.insert(instruction.id, unsubscribe.clone());
-                        let mut instruction = instruction.clone();
-                        instruction.method = Method::getAccountInfo;
-                        info!(new_http_subscription_id = instruction.id);
-                        let instruction = serde_json::to_string(&instruction).unwrap();
-                        let mut endpoint = PollHTTP {
-                            client: client.clone(),
-                            url: url.clone(),
-                            frequency: frequency.clone(),
-                            instruction: instruction,
-                            unsubscribe: unsubscribe.clone(),
-                            send: self.send.clone(),
-                        };
-                        tokio::spawn(async move {
-                            endpoint.run().await;
-                        });
-                    }
-
-                    Method::accountUnsubscribe => {
-                        if let Some(unsubscribe) = unsubscribe_by_id.get(&instruction.id) {
-                            let mut val = unsubscribe.lock().unwrap();
-                            *val = true;
-                        }
-                        info!(http_unsubscribe_global_id = instruction.id);
-                        unsubscribe_by_id.remove(&instruction.id);
-                    }
-
-                    _ => {
-                        self.send_error(
-                            ErrorCode::InvalidRequest,
-                            "unknown instruction".to_string(),
-                            instruction.id,
-                        );
-                    }
-                },
-            }
-        }
-    }
-
-    /// Manages a PubSub endpoint.
-    async fn run_pubsub(&mut self, websocket: WebSocketStream<MaybeTlsStream<TcpStream>>) {
-        let (mut to_endpoint, from_endpoint) = websocket.split();
-        let subscription_to_id = Arc::new(Mutex::new(HashMap::new()));
-        let id_to_subscription = Arc::new(Mutex::new(HashMap::new()));
-
-        let mut pubsub = PollPubSub {
-            from_endpoint,
-            subscription_to_id: subscription_to_id.clone(),
-            send: self.send.clone(),
-            id_to_subscription: id_to_subscription.clone(),
-        };
-        tokio::spawn(async move {
-            pubsub.run().await;
-        });
-
-        let mut interval = time::interval(Duration::from_secs(30));
-        loop {
-            tokio::select! {
-                Some(from_server) = self.receive.recv() => {
-                    self.on_server_message(
-                        from_server,
-                        &mut to_endpoint,
-                        id_to_subscription.clone(),
-                        subscription_to_id.clone()
-                    ).await;
-                }
-
-                _ = interval.tick() => {
-                    self.send_keepalive(&mut to_endpoint).await;
-                }
-            }
-        }
-    }
-
-    async fn send_keepalive(
-        &mut self,
-        to_endpoint: &mut SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>,
-    ) {
-        let instruction = "";
-        if let Err(err) = to_endpoint.send(Message::from(instruction)).await {
-            error!(instruction_to_endpoint_channel_failure = err.to_string().as_str());
-        }
-    }
-
     async fn on_server_message(
         &mut self,
         from_server: ServerToEndpoint,

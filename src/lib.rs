@@ -1,3 +1,4 @@
+mod account_subscription;
 mod channel_types;
 mod client;
 mod endpoint;

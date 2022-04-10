@@ -168,17 +168,13 @@ impl PubsubEndpoint {
         match message {
             ServerToPubsub::AccountSubscribe {
                 subscription,
-                pubkey,
+                request,
             } => {
                 info!(
-                    "pubsub endpoint subscribing to {} as global id {}",
-                    &pubkey, subscription.0
+                    "pubsub endpoint subscribing to global id {}",
+                    subscription.0
                 );
-                let instruction = format!(
-                    r#"{{"jsonrpc":"2.0","id":{},"method":"accountSubscribe","params":["{}",{{"encoding":"base64","commitment":"confirmed"}}]}}"#,
-                    subscription.0, pubkey
-                );
-                if let Err(err) = self.enqueue.send(Message::Text(instruction)) {
+                if let Err(err) = self.enqueue.send(Message::Text(request)) {
                     error!("failed to enqueue pubsub write: {}", err);
                 }
             }
@@ -343,26 +339,21 @@ impl HTTPEndpoint {
         match message {
             ServerToHTTP::AccountSubscribe {
                 subscription,
-                pubkey,
+                request,
             } => {
                 info!(
-                    "http endpoint {} subscribing to pubkey {} as global id {}",
+                    "http endpoint {} subscribing to global id {}",
                     self.url.as_str(),
-                    &pubkey,
                     subscription.0,
                 );
                 let (send_unsubscribe, receive_unsubscribe) = oneshot::channel();
                 self.account_unsubscribe
                     .insert(subscription.clone(), send_unsubscribe);
-                let instruction = format!(
-                    r#"{{"jsonrpc":"2.0","id":{},"method":"getAccountInfo","params":["{}",{{"encoding":"base64","commitment":"confirmed"}}]}}"#,
-                    subscription.0, pubkey
-                );
                 let mut poll = HTTPPoll::new(
                     self.client.clone(),
                     self.url.clone(),
                     self.frequency.clone(),
-                    instruction,
+                    request,
                     receive_unsubscribe,
                     self.send_to_server.clone(),
                 );

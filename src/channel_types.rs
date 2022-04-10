@@ -1,4 +1,5 @@
 use crate::jsonrpc;
+use std::str::FromStr;
 use tokio::sync::mpsc::UnboundedSender;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -31,6 +32,59 @@ pub enum Encoding {
     Base64Zstd,
 }
 
+impl FromStr for Encoding {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "base58" => Ok(Encoding::Base58),
+            "base64" => Ok(Encoding::Base64),
+            "base64+zstd" => Ok(Encoding::Base64Zstd),
+            _ => Err(s.to_string()),
+        }
+    }
+}
+
+impl ToString for Encoding {
+    fn to_string(&self) -> String {
+        match *self {
+            Encoding::Base58 => "base58",
+            Encoding::Base64 => "base64",
+            Encoding::Base64Zstd => "base64+zstd",
+        }
+        .to_string()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Commitment {
+    Finalized,
+    Confirmed,
+    Processed,
+}
+
+impl FromStr for Commitment {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "finalized" => Ok(Commitment::Finalized),
+            "confirmed" => Ok(Commitment::Confirmed),
+            "processed" => Ok(Commitment::Processed),
+            _ => Err(s.to_string()),
+        }
+    }
+}
+
+impl ToString for Commitment {
+    fn to_string(&self) -> String {
+        match *self {
+            Commitment::Finalized => "finalized",
+            Commitment::Confirmed => "confirmed",
+            Commitment::Processed => "processed",
+        }
+        .to_string()
+    }
+}
+
 #[derive(Debug)]
 pub enum ServerToClient {
     Initialize(ClientID),
@@ -41,7 +95,7 @@ pub enum ServerToClient {
 pub enum ServerToHTTP {
     AccountSubscribe {
         subscription: ServerInstructionID,
-        pubkey: String,
+        request: String,
     },
     AccountUnsubscribe(ServerInstructionID),
     DirectRequest(jsonrpc::Request, UnboundedSender<ServerToClient>),
@@ -51,7 +105,7 @@ pub enum ServerToHTTP {
 pub enum ServerToPubsub {
     AccountSubscribe {
         subscription: ServerInstructionID,
-        pubkey: String,
+        request: String,
     },
     AccountUnsubscribe {
         request_id: ServerInstructionID,

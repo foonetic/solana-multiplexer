@@ -1,45 +1,18 @@
 use crate::{
+    account_subscription::{self, AccountSubscription, AccountSubscriptionMetadata},
     channel_types::*,
     client::ClientHandler,
     endpoint::{self, EndpointConfig},
     jsonrpc,
-    subscription_tracker::{ConstructFromClientID, SubscriptionTracker},
+    subscription_tracker::SubscriptionTracker,
 };
 use hyper::service::{make_service_fn, service_fn};
 use std::{
     collections::{hash_map::Entry, HashMap},
-    hash::{Hash, Hasher},
     sync::Arc,
 };
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tracing::{error, info};
-
-#[derive(Clone, Debug, Eq)]
-struct AccountSubscription {
-    client: ClientID,
-    encoding: Encoding,
-}
-
-impl ConstructFromClientID for AccountSubscription {
-    fn from_client_id(id: &ClientID) -> Self {
-        Self {
-            client: id.clone(),
-            encoding: Encoding::Base58, // Arbitrary since this isn't part of the hash.
-        }
-    }
-}
-
-impl Hash for AccountSubscription {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.client.hash(state);
-    }
-}
-
-impl PartialEq for AccountSubscription {
-    fn eq(&self, other: &Self) -> bool {
-        self.client == other.client
-    }
-}
 
 /// Implements a subset of a Solana PubSub endpoint that multiplexes across
 /// various endpoints.
@@ -55,9 +28,8 @@ pub struct Server {
     send_to_pubsub: Vec<UnboundedSender<ServerToPubsub>>,
     send_to_client: HashMap<ClientID, UnboundedSender<ServerToClient>>,
 
-    account_subscription_tracker: SubscriptionTracker<AccountSubscription>,
-    pubkey_to_subscription: HashMap<String, ServerInstructionID>,
-    subscription_to_pubkey: HashMap<ServerInstructionID, String>,
+    account_subscription_tracker:
+        SubscriptionTracker<AccountSubscription, AccountSubscriptionMetadata>,
 }
 
 impl Server {
@@ -78,8 +50,6 @@ impl Server {
             send_to_pubsub: Vec::new(),
             send_to_client: HashMap::new(),
             account_subscription_tracker: SubscriptionTracker::new(),
-            pubkey_to_subscription: HashMap::new(),
-            subscription_to_pubkey: HashMap::new(),
         }
     }
 
@@ -218,12 +188,6 @@ impl Server {
     }
 
     fn broadcast_account_notification(&mut self, notification: &jsonrpc::AccountNotification) {
-        let data = notification.params.result.value.data.get(0);
-        if data.is_none() {
-            return;
-        }
-        let data = data.unwrap();
-
         if let Some(subscribers) = self
             .account_subscription_tracker
             .get_notification_subscribers(notification)
@@ -233,83 +197,29 @@ impl Server {
                 let mut raw_bytes = None;
 
                 if let Some(sender) = self.send_to_client.get(&subscriber.client) {
-                    match cache.entry(subscriber.encoding.clone()) {
-                        Entry::Occupied(element) => {
-                            Self::send_string(sender.clone(), element.get().clone());
-                        }
-                        Entry::Vacant(element) => {
-                            let notification = match subscriber.encoding {
-                                Encoding::Base58 => {
-                                    if raw_bytes.is_none() {
-                                        let decode = base64::decode(data);
-                                        if decode.is_err() {
-                                            return;
-                                        }
-                                        raw_bytes = Some(decode.unwrap());
+                    if let Some(subscription) = &subscriber.subscription {
+                        match cache.entry(subscription.encoding.clone()) {
+                            Entry::Occupied(element) => {
+                                Self::send_string(sender.clone(), element.get().clone());
+                            }
+                            Entry::Vacant(element) => {
+                                match account_subscription::format_notification(
+                                    &mut raw_bytes,
+                                    notification,
+                                    subscription,
+                                ) {
+                                    Some(value) => {
+                                        Self::send_string(sender.clone(), value.clone());
+                                        element.insert(value);
                                     }
-                                    let data_string =
-                                        bs58::encode(&raw_bytes.unwrap()).into_string();
-                                    let mut notification = notification.clone();
-                                    if let Some(loc) =
-                                        notification.params.result.value.data.get_mut(0)
-                                    {
-                                        *loc = data_string;
+                                    None => {
+                                        error!(
+                                            "notification could not be formatted: {:?}",
+                                            notification
+                                        );
                                     }
-                                    if let Some(enc) =
-                                        notification.params.result.value.data.get_mut(1)
-                                    {
-                                        *enc = "base58".to_string();
-                                    } else {
-                                        notification
-                                            .params
-                                            .result
-                                            .value
-                                            .data
-                                            .push("base58".to_string());
-                                    }
-                                    notification
                                 }
-                                Encoding::Base64 => notification.clone(),
-                                Encoding::Base64Zstd => {
-                                    if raw_bytes.is_none() {
-                                        let decode = base64::decode(data);
-                                        if decode.is_err() {
-                                            return;
-                                        }
-                                        raw_bytes = Some(decode.unwrap());
-                                    }
-                                    let res =
-                                        zstd::stream::encode_all(raw_bytes.unwrap().as_slice(), 0);
-                                    if res.is_err() {
-                                        return;
-                                    }
-                                    let res = res.unwrap();
-                                    let data_string = base64::encode(&res);
-                                    let mut notification = notification.clone();
-                                    if let Some(loc) =
-                                        notification.params.result.value.data.get_mut(0)
-                                    {
-                                        *loc = data_string;
-                                    }
-                                    if let Some(enc) =
-                                        notification.params.result.value.data.get_mut(1)
-                                    {
-                                        *enc = "base64+zstd".to_string();
-                                    } else {
-                                        notification
-                                            .params
-                                            .result
-                                            .value
-                                            .data
-                                            .push("base64+zstd".to_string());
-                                    }
-                                    notification
-                                }
-                            };
-                            let value = serde_json::to_string(&notification)
-                                .expect("unable to serialize account notification");
-                            Self::send_string(sender.clone(), value.clone());
-                            element.insert(value);
+                            }
                         }
                     }
                 }
@@ -324,9 +234,6 @@ impl Server {
         let mut to_unsubscribe = self.account_subscription_tracker.remove_client(&client);
         for unsubscribe in to_unsubscribe.drain(0..) {
             self.remove_global_subscription(&unsubscribe);
-            if let Entry::Occupied(pubkey) = self.subscription_to_pubkey.entry(unsubscribe) {
-                self.pubkey_to_subscription.remove(&pubkey.remove());
-            }
         }
     }
 
@@ -481,105 +388,60 @@ impl Server {
         client: ClientID,
         request: jsonrpc::Request,
     ) {
-        if let serde_json::Value::Array(mut params) = request.params {
-            if let Some(serde_json::Value::String(pubkey)) = params.get(0) {
-                let pubkey = pubkey.clone();
-                let encoding = if let Some(serde_json::Value::String(val)) =
-                    params.get_mut(1).and_then(|obj| {
-                        if let serde_json::Value::Object(obj) = obj {
-                            obj.get_mut("encoding")
-                        } else {
-                            None
-                        }
-                    }) {
-                    let original = val.clone();
-                    *val = "base64".to_string();
-                    original
-                } else {
-                    "base64".to_string()
-                };
+        let result = account_subscription::parse_subscribe(&request);
+        match result {
+            Ok((metadata, subscription)) => {
+                let (subscription_id, is_new) =
+                    self.account_subscription_tracker.track_subscription(
+                        &client,
+                        &mut self.next_instruction_id,
+                        Some(subscription),
+                        metadata.clone(),
+                    );
 
-                let recognized_encoding;
-                match encoding.as_str() {
-                    "base58" => recognized_encoding = Encoding::Base58,
-                    "base64" => recognized_encoding = Encoding::Base64,
-                    "base64+zstd" => recognized_encoding = Encoding::Base64Zstd,
-                    _ => {
-                        Self::send_error(
-                            send_to_client,
-                            jsonrpc::ErrorCode::InvalidParams,
-                            format!("unrecognized encoding {}", encoding),
-                            request.id,
+                if is_new {
+                    info!(
+                        "pubsub client {} subscribing to {} as global id {}",
+                        client.0, &metadata.pubkey, subscription_id.0
+                    );
+                    if self.send_to_pubsub.len() > 0 {
+                        let request = account_subscription::format_pubsub_subscription(
+                            &subscription_id,
+                            &metadata,
                         );
-                        return;
-                    }
-                }
-
-                // Update bidirectional pubkey mapping.
-                let subscription = self.pubkey_to_subscription.entry(pubkey.clone());
-                let subscription_id = match subscription {
-                    Entry::Occupied(existing) => existing.get().clone(),
-                    Entry::Vacant(put) => {
-                        let current_id = self.next_instruction_id.clone();
-                        self.next_instruction_id.0 += 1;
-                        put.insert(current_id.clone());
-
-                        // In this branch of the code, we need to send a new subscription request.
                         for endpoint in self.send_to_pubsub.iter() {
                             endpoint
                                 .send(ServerToPubsub::AccountSubscribe {
-                                    subscription: current_id.clone(),
-                                    pubkey: pubkey.clone(),
+                                    subscription: subscription_id.clone(),
+                                    request: request.clone(),
                                 })
                                 .expect("pubsub endpoint channel died");
                         }
+                    }
+                    if self.send_to_http.len() > 0 {
+                        let request =
+                            account_subscription::format_http_poll(&subscription_id, &metadata);
                         for endpoint in self.send_to_http.iter() {
                             endpoint
                                 .send(ServerToHTTP::AccountSubscribe {
-                                    subscription: current_id.clone(),
-                                    pubkey: pubkey.clone(),
+                                    subscription: subscription_id.clone(),
+                                    request: request.clone(),
                                 })
                                 .expect("http endpoint channel died");
                         }
-                        current_id
                     }
-                };
-
-                info!(
-                    "pubsub client {} subscribing to {} as global id {}",
-                    client.0, &pubkey, subscription_id.0
-                );
-
-                self.subscription_to_pubkey
-                    .insert(subscription_id.clone(), pubkey.clone());
-
-                // Update bidirectional client mapping.
-                let subscriber = AccountSubscription {
-                    client: client.clone(),
-                    encoding: recognized_encoding,
-                };
-                self.account_subscription_tracker.track_subscriber(
-                    &client,
-                    &subscription_id,
-                    subscriber,
-                );
+                }
 
                 Self::send_subscription_response(send_to_client, request.id, subscription_id.0);
-            } else {
+            }
+            Err(err) => {
                 Self::send_error(
                     send_to_client,
                     jsonrpc::ErrorCode::InvalidParams,
-                    "no public key provided".to_string(),
+                    err.to_string(),
                     request.id,
                 );
             }
-        } else {
-            Self::send_error(
-                send_to_client,
-                jsonrpc::ErrorCode::InvalidParams,
-                "subscription takes array parameter".to_string(),
-                request.id,
-            );
         }
     }
 

@@ -1,0 +1,90 @@
+use serde::{Deserialize, Serialize};
+use serde_repr::*;
+
+#[derive(Serialize_repr, Deserialize_repr, Debug, Clone)]
+#[repr(i32)]
+pub enum ErrorCode {
+    ParseError = -32700,
+    InvalidRequest = -32600,
+    MethodNotFound = -32601,
+    InvalidParams = -32602,
+    InternalError = -32603,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct Error {
+    pub jsonrpc: String,
+    pub code: ErrorCode,
+    pub message: String,
+    pub id: i64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct Request {
+    pub jsonrpc: String,
+    pub id: i64,
+    pub method: String,
+    pub params: serde_json::Value,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct Notification {
+    pub jsonrpc: String,
+    pub method: String,
+    pub params: serde_json::Value,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct AccountNotification {
+    pub jsonrpc: String,
+    pub method: String,
+    pub params: AccountNotificationParams,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct AccountNotificationParams {
+    pub result: AccountNotificationResult,
+    pub subscription: i64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct AccountInfo {
+    pub jsonrpc: String,
+    pub result: AccountNotificationResult,
+    pub id: i64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct AccountNotificationResult {
+    pub context: ContextWithSlot,
+    pub value: AccountNotificationValue,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ContextWithSlot {
+    pub slot: u64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[allow(non_snake_case)]
+pub struct AccountNotificationValue {
+    pub data: Vec<String>,
+    pub executable: bool,
+    pub lamports: u64,
+    pub owner: String,
+    pub rentEpoch: u64,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct SubscribeResponse {
+    pub jsonrpc: String,
+    pub result: i64,
+    pub id: i64,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct UnsubscribeResponse {
+    pub jsonrpc: String,
+    pub result: bool,
+    pub id: i64,
+}

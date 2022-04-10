@@ -1,281 +1,698 @@
 use crate::{
-    arbitrator::EndpointArbitrator,
+    channel_types::*,
+    client::ClientHandler,
     endpoint::{self, EndpointConfig},
-    listener::PortListener,
-    messages::*,
+    jsonrpc,
 };
+use hyper::service::{make_service_fn, service_fn};
 use std::{
-    collections::{HashMap, HashSet},
-    sync::{Arc, Mutex},
+    collections::{hash_map::Entry, HashMap, HashSet},
+    hash::{Hash, Hasher},
+    sync::Arc,
 };
-use tokio::{
-    net::TcpListener,
-    sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
-};
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tracing::{error, info};
 
-/// Spawns an event loop that arbitrates messages as they arrive from various
-/// endpoints. The messages from the endpoints are assumed to have their
-/// subscription ids already corrected to the global unique id.
-fn spawn_arbitrator(
-    receive_from_endpoints: UnboundedReceiver<EndpointToServer>,
-    client_senders: Arc<Mutex<HashMap<u64, UnboundedSender<ServerToClient>>>>,
-    subscriptions: Arc<Mutex<HashMap<i64, HashSet<u64>>>>,
-) {
-    let mut arbitrator =
-        EndpointArbitrator::new(receive_from_endpoints, client_senders, subscriptions);
-    tokio::spawn(async move {
-        arbitrator.run().await;
-    });
+#[derive(Clone, Debug, Eq)]
+struct Subscriber {
+    client: ClientID,
+    encoding: Encoding,
 }
 
-/// Spawns an event loop that initializes new client connections.
-async fn spawn_port_listener(
-    address: &str,
-    client_to_server: UnboundedSender<ClientToServer>,
-) -> Arc<Mutex<HashMap<u64, UnboundedSender<ServerToClient>>>> {
-    let clients = Arc::new(Mutex::new(HashMap::new()));
+impl Hash for Subscriber {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.client.hash(state);
+    }
+}
 
-    let listener = TcpListener::bind(address).await.unwrap();
-    let mut client_listener = PortListener::new(clients.clone(), client_to_server);
-    tokio::spawn(async move {
-        client_listener.run(listener).await;
-    });
-
-    clients
+impl PartialEq for Subscriber {
+    fn eq(&self, other: &Self) -> bool {
+        self.client == other.client
+    }
 }
 
 /// Implements a subset of a Solana PubSub endpoint that multiplexes across
 /// various endpoints.
 pub struct Server {
-    receive_from_clients: UnboundedReceiver<ClientToServer>,
-    client_senders: Arc<Mutex<HashMap<u64, UnboundedSender<ServerToClient>>>>,
-    next_instruction_id: i64,
-    pubkey_to_subscription: HashMap<String, i64>,
-    subscription_to_client: Arc<Mutex<HashMap<i64, HashSet<u64>>>>,
-    client_to_subscription: Arc<Mutex<HashMap<u64, HashSet<i64>>>>,
-    endpoints: Vec<UnboundedSender<ServerToEndpoint>>,
+    next_client_id: ClientID,
+    next_instruction_id: ServerInstructionID,
+    next_http_endpoint: u64,
+    client_to_server: UnboundedSender<ClientToServer>,
+    receive_from_client: UnboundedReceiver<ClientToServer>,
+    endpoint_to_server: UnboundedSender<EndpointToServer>,
+    receive_from_endpoint: UnboundedReceiver<EndpointToServer>,
+    send_to_http: Vec<UnboundedSender<ServerToHTTP>>,
+    send_to_pubsub: Vec<UnboundedSender<ServerToPubsub>>,
+    send_to_client: HashMap<ClientID, UnboundedSender<ServerToClient>>,
+
+    // Account subscription management.
+    client_to_subscriptions: HashMap<ClientID, HashSet<ServerInstructionID>>,
+    subscription_to_clients: HashMap<ServerInstructionID, HashSet<Subscriber>>,
+    pubkey_to_subscription: HashMap<String, ServerInstructionID>,
+    subscription_to_pubkey: HashMap<ServerInstructionID, String>,
+
+    // Arbitration of messages, assumed to be stored in base64.
+    account_notifications: HashMap<ServerInstructionID, u64>,
 }
 
 impl Server {
     /// Initializes the server to connect to the given endpoints. The server
     /// will listen at the input address.
-    pub async fn new(config: &[EndpointConfig], address: &str) -> Self {
-        let (client_to_server, receive_from_clients) = unbounded_channel();
-        let (receive_from_endpoints, endpoints) = endpoint::spawn(config).await;
-        let client_senders = spawn_port_listener(address, client_to_server).await;
-        let subscription_to_client = Arc::new(Mutex::new(HashMap::new()));
-        let client_to_subscription = Arc::new(Mutex::new(HashMap::new()));
-        spawn_arbitrator(
-            receive_from_endpoints,
-            client_senders.clone(),
-            subscription_to_client.clone(),
-        );
-
+    pub fn new() -> Self {
+        let (client_to_server, receive_from_client) = unbounded_channel();
+        let (endpoint_to_server, receive_from_endpoint) = unbounded_channel();
         Server {
-            receive_from_clients,
-            client_senders,
-            next_instruction_id: 1,
+            next_client_id: ClientID(0),
+            next_instruction_id: ServerInstructionID(0),
+            next_http_endpoint: 0,
+            client_to_server,
+            receive_from_client,
+            endpoint_to_server,
+            receive_from_endpoint,
+            send_to_http: Vec::new(),
+            send_to_pubsub: Vec::new(),
+            send_to_client: HashMap::new(),
+            client_to_subscriptions: HashMap::new(),
+            subscription_to_clients: HashMap::new(),
             pubkey_to_subscription: HashMap::new(),
-            subscription_to_client,
-            client_to_subscription,
-            endpoints,
+            subscription_to_pubkey: HashMap::new(),
+            account_notifications: HashMap::new(),
         }
     }
 
     /// Server event loop that continuously polls for new clients.
-    pub async fn run(&mut self) {
-        while let Some(from_client) = self.receive_from_clients.recv().await {
-            match from_client {
-                ClientToServer::RemoveClient(client) => {
-                    self.process_remove_client(client);
+    pub async fn run(
+        &mut self,
+        config: &[EndpointConfig],
+        address: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.spawn_endpoints(config).await;
+        self.spawn_listener(address).await?;
+
+        loop {
+            self.poll().await;
+        }
+    }
+
+    async fn poll(&mut self) {
+        tokio::select! {
+            Some(from_client) = self.receive_from_client.recv() => {
+                self.on_client_message(from_client);
+            }
+            Some(from_endpoint) = self.receive_from_endpoint.recv() => {
+                self.on_endpoint_message(from_endpoint);
+            }
+        }
+    }
+
+    async fn spawn_listener(&self, address: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let address: std::net::SocketAddr = address.parse()?;
+        let send_to_server = self.client_to_server.clone();
+
+        let make_service = make_service_fn(move |_| {
+            // Called once per connection.
+            let send_to_server = send_to_server.clone();
+
+            async move {
+                // Called once per request.
+
+                Ok::<_, hyper::Error>(service_fn(move |request| {
+                    let mut client_handler = ClientHandler::new(send_to_server.clone());
+
+                    // Returns the future that should be executed to get a response.
+                    async move { client_handler.run(request).await }
+                }))
+            }
+        });
+
+        tokio::spawn(async move {
+            if let Err(err) = hyper::Server::bind(&address).serve(make_service).await {
+                error!("unable to serve: {}", err);
+            }
+        });
+        Ok(())
+    }
+
+    async fn spawn_endpoints(&mut self, config: &[EndpointConfig]) {
+        let client = Arc::new(reqwest::Client::new());
+        for endpoint in config.iter() {
+            match endpoint {
+                EndpointConfig::HTTP(url, frequency) => {
+                    let (server_to_endpoint, receive_from_server) = unbounded_channel();
+                    info!("connecting to HTTP endpoint {}", url.as_str());
+                    let mut http_endpoint = endpoint::HTTPEndpoint::new(
+                        client.clone(),
+                        url.clone(),
+                        frequency.clone(),
+                        self.endpoint_to_server.clone(),
+                        receive_from_server,
+                    );
+                    tokio::spawn(async move {
+                        http_endpoint.run().await;
+                    });
+                    self.send_to_http.push(server_to_endpoint);
                 }
 
-                ClientToServer::Instruction(client, instruction) => {
-                    self.process_instruction(client, &instruction);
+                EndpointConfig::PubSub(url) => {
+                    let (server_to_endpoint, receive_from_server) = unbounded_channel();
+                    info!("connecting to Pubsub endpoint {}", url.as_str());
+                    let (ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+                    let mut pubsub_endpoint = endpoint::PubsubEndpoint::new(
+                        ws,
+                        self.endpoint_to_server.clone(),
+                        receive_from_server,
+                    );
+                    tokio::spawn(async move {
+                        pubsub_endpoint.run().await;
+                    });
+                    self.send_to_pubsub.push(server_to_endpoint);
                 }
             }
         }
     }
 
-    fn process_remove_client(&mut self, client: u64) {
-        let mut clients = self.client_senders.lock().unwrap();
-        clients.remove(&client);
-        info!(remove_client_id = client);
+    fn on_client_message(&mut self, message: ClientToServer) {
+        match message {
+            ClientToServer::Initialize(sender) => {
+                let id = self.next_client_id.clone();
+                self.next_client_id.0 += 1;
+                // If the client already disconnected, do nothing.
+                if let Ok(_) = sender.send(ServerToClient::Initialize(id.clone())) {
+                    info!("initializing new client with id {}", id.0);
+                    self.send_to_client.insert(id, sender);
+                }
+            }
 
-        let mut client_to_subscription = self.client_to_subscription.lock().unwrap();
-        let mut subscription_to_client = self.subscription_to_client.lock().unwrap();
-        let mut to_unsubscribe = Vec::new();
-        if let Some(subscriptions) = client_to_subscription.get(&client) {
-            for subscription in subscriptions.iter() {
-                if let Some(subscribed_clients) = subscription_to_client.get_mut(&subscription) {
-                    subscribed_clients.remove(&client);
-                    if subscribed_clients.len() == 0 {
-                        to_unsubscribe.push(subscription);
+            ClientToServer::RemoveClient(client) => {
+                self.process_remove_client(client);
+            }
+
+            ClientToServer::PubSubRequest { client, request } => {
+                self.process_pubsub(client, request);
+            }
+
+            ClientToServer::HTTPRequest { client, request } => {
+                self.process_http(client, request);
+            }
+        }
+    }
+
+    fn on_endpoint_message(&mut self, message: EndpointToServer) {
+        match message {
+            EndpointToServer::AccountNotification(notification) => {
+                self.process_account_notification(notification);
+            }
+        }
+    }
+
+    fn process_account_notification(&mut self, notification: jsonrpc::AccountNotification) {
+        let latest = self
+            .account_notifications
+            .entry(ServerInstructionID(notification.params.subscription));
+        let should_broadcast = match latest {
+            Entry::Vacant(entry) => {
+                entry.insert(notification.params.result.context.slot);
+                true
+            }
+            Entry::Occupied(mut existing) => {
+                if *existing.get() < notification.params.result.context.slot {
+                    existing.insert(notification.params.result.context.slot);
+                    true
+                } else {
+                    false
+                }
+            }
+        };
+        if should_broadcast {
+            self.broadcast_account_notification(&notification);
+        }
+    }
+
+    fn broadcast_account_notification(&mut self, notification: &jsonrpc::AccountNotification) {
+        let data = notification.params.result.value.data.get(0);
+        if data.is_none() {
+            return;
+        }
+        let data = data.unwrap();
+
+        if let Some(subscribers) = self
+            .subscription_to_clients
+            .get(&ServerInstructionID(notification.params.subscription))
+        {
+            let mut cache: HashMap<Encoding, String> = HashMap::new();
+            for subscriber in subscribers.iter() {
+                let mut raw_bytes = None;
+
+                if let Some(sender) = self.send_to_client.get(&subscriber.client) {
+                    match cache.entry(subscriber.encoding.clone()) {
+                        Entry::Occupied(element) => {
+                            Self::send_string(sender.clone(), element.get().clone());
+                        }
+                        Entry::Vacant(element) => {
+                            let notification = match subscriber.encoding {
+                                Encoding::Base58 => {
+                                    if raw_bytes.is_none() {
+                                        let decode = base64::decode(data);
+                                        if decode.is_err() {
+                                            return;
+                                        }
+                                        raw_bytes = Some(decode.unwrap());
+                                    }
+                                    let data_string =
+                                        bs58::encode(&raw_bytes.unwrap()).into_string();
+                                    let mut notification = notification.clone();
+                                    if let Some(loc) =
+                                        notification.params.result.value.data.get_mut(0)
+                                    {
+                                        *loc = data_string;
+                                    }
+                                    if let Some(enc) =
+                                        notification.params.result.value.data.get_mut(1)
+                                    {
+                                        *enc = "base58".to_string();
+                                    } else {
+                                        notification
+                                            .params
+                                            .result
+                                            .value
+                                            .data
+                                            .push("base58".to_string());
+                                    }
+                                    notification
+                                }
+                                Encoding::Base64 => notification.clone(),
+                                Encoding::Base64Zstd => {
+                                    if raw_bytes.is_none() {
+                                        let decode = base64::decode(data);
+                                        if decode.is_err() {
+                                            return;
+                                        }
+                                        raw_bytes = Some(decode.unwrap());
+                                    }
+                                    let res =
+                                        zstd::stream::encode_all(raw_bytes.unwrap().as_slice(), 0);
+                                    if res.is_err() {
+                                        return;
+                                    }
+                                    let res = res.unwrap();
+                                    let data_string = base64::encode(&res);
+                                    let mut notification = notification.clone();
+                                    if let Some(loc) =
+                                        notification.params.result.value.data.get_mut(0)
+                                    {
+                                        *loc = data_string;
+                                    }
+                                    if let Some(enc) =
+                                        notification.params.result.value.data.get_mut(1)
+                                    {
+                                        *enc = "base64+zstd".to_string();
+                                    } else {
+                                        notification
+                                            .params
+                                            .result
+                                            .value
+                                            .data
+                                            .push("base64+zstd".to_string());
+                                    }
+                                    notification
+                                }
+                            };
+                            let value = serde_json::to_string(&notification)
+                                .expect("unable to serialize account notification");
+                            Self::send_string(sender.clone(), value.clone());
+                            element.insert(value);
+                        }
                     }
                 }
             }
         }
-        for unsubscribe in to_unsubscribe.iter() {
-            subscription_to_client.remove(unsubscribe);
+    }
 
-            for endpoint in self.endpoints.iter() {
-                // TODO: How should we handle channel write failures?
+    fn process_remove_client(&mut self, client: ClientID) {
+        self.send_to_client.remove(&client);
+        info!("removing client {}", client.0);
 
-                if let Err(err) = endpoint.send(ServerToEndpoint::Instruction(Instruction {
-                    jsonrpc: "2.0".to_string(),
-                    id: self.next_instruction_id,
-                    method: Method::accountUnsubscribe,
-                    params: serde_json::Value::Array(vec![serde_json::Value::Number(
-                        serde_json::Number::from(**unsubscribe),
-                    )]),
-                })) {
-                    error!(endpoint_channel_failure = err.to_string().as_str());
+        let mut to_unsubscribe = Vec::new();
+        if let Some(subscriptions) = self.client_to_subscriptions.get(&client) {
+            for subscription in subscriptions.iter() {
+                if let Some(subscribed_clients) =
+                    self.subscription_to_clients.get_mut(&subscription)
+                {
+                    subscribed_clients.remove(&Subscriber {
+                        client: client.clone(),
+                        encoding: Encoding::Base58, // Arbitrary; not hashed or compared.
+                    });
+                    if subscribed_clients.len() == 0 {
+                        to_unsubscribe.push(subscription.clone());
+                    }
+                }
+            }
+        }
+        for unsubscribe in to_unsubscribe.drain(0..) {
+            self.remove_global_subscription(unsubscribe);
+        }
+        self.client_to_subscriptions.remove(&client);
+    }
+
+    /// Unsubscribes from a global subscription ID. This does *NOT* check that
+    /// all clients have been removed! Caller is responsible for ensuring that
+    /// the subscription is indeed no longer needed.
+    fn remove_global_subscription(&mut self, unsubscribe: ServerInstructionID) {
+        self.subscription_to_clients.remove(&unsubscribe);
+        let instruction_id = self.next_instruction_id.clone();
+        self.next_instruction_id.0 += 1;
+
+        for endpoint in self.send_to_http.iter() {
+            if let Err(err) = endpoint.send(ServerToHTTP::AccountUnsubscribe(unsubscribe.clone())) {
+                error!("server to http channel failure: {}", err);
+            }
+        }
+
+        for endpoint in self.send_to_pubsub.iter() {
+            if let Err(err) = endpoint.send(ServerToPubsub::AccountUnsubscribe {
+                request_id: instruction_id.clone(),
+                subscription: unsubscribe.clone(),
+            }) {
+                error!("server to pubsub channel failure: {}", err);
+            }
+        }
+
+        let entry = self.subscription_to_pubkey.entry(unsubscribe.clone());
+        if let Entry::Occupied(pubkey) = entry {
+            self.pubkey_to_subscription.remove(&pubkey.remove());
+        }
+    }
+
+    fn process_pubsub(&mut self, client: ClientID, request: jsonrpc::Request) {
+        let send_to_client = self.send_to_client.get(&client);
+        if send_to_client.is_none() {
+            return;
+        }
+        let send_to_client = send_to_client.unwrap().clone();
+
+        match request.method.as_str() {
+            "accountSubscribe" => {
+                self.process_account_subscribe(send_to_client.clone(), client, request);
+            }
+            "accountUnsubscribe" => {
+                self.process_account_unsubscribe(send_to_client.clone(), client, request);
+            }
+            unknown => {
+                Self::send_error(
+                    send_to_client.clone(),
+                    jsonrpc::ErrorCode::MethodNotFound,
+                    format!("unknown method {}", unknown),
+                    request.id,
+                );
+            }
+        }
+    }
+
+    fn process_http(&mut self, client: ClientID, request: jsonrpc::Request) {
+        // The client may have already disconnected. In that case, skip the request.
+        if let Some(send_to_client) = self.send_to_client.get(&client) {
+            if self.send_to_http.len() == 0 {
+                Self::send_error(
+                    send_to_client.clone(),
+                    jsonrpc::ErrorCode::InternalError,
+                    "no HTTP endpoints defined".to_string(),
+                    request.id,
+                );
+                return;
+            }
+            // Round robin the HTTP endpoint.
+            let endpoint = self.next_http_endpoint % self.send_to_http.len() as u64;
+            self.next_http_endpoint = self.next_http_endpoint.wrapping_add(1);
+            let request_id = request.id;
+
+            // This check covers the corner case where there are no HTTP endpoints.
+            if let Some(endpoint) = self.send_to_http.get(endpoint as usize) {
+                // Let the HTTP endpoint directly send the response back to the
+                // client, since no arbitration is needed.
+                if let Err(err) =
+                    endpoint.send(ServerToHTTP::DirectRequest(request, send_to_client.clone()))
+                {
+                    Self::send_error(
+                        send_to_client.clone(),
+                        jsonrpc::ErrorCode::InternalError,
+                        format!("send to HTTP channel failed: {}", err),
+                        request_id,
+                    );
+                }
+            } else {
+                if self.send_to_http.len() == 0 {
+                    Self::send_error(
+                        send_to_client.clone(),
+                        jsonrpc::ErrorCode::InternalError,
+                        "unable to communicate with endpoint".to_string(),
+                        request.id,
+                    );
+                    return;
                 }
             }
 
-            // TODO: We should also remove the pubkey from the tracked mapping.
-            // For now, cache the pubkey so all subscriptions in one multiplexer
-            // instance will have a consistent identifier.
-
-            self.next_instruction_id += 1;
+            return;
         }
-        client_to_subscription.remove(&client);
+        info!("client {} disconnected", client.0);
     }
 
-    /// Processes instructions sent from clients. The server is responsible for
-    /// mapping client ids to globally unique ids before forwarding to
-    /// endpoints.
-    fn process_instruction(&mut self, client: u64, instruction: &Instruction) {
-        match instruction.method {
-            Method::accountSubscribe => {
-                self.process_account_subscribe(client, instruction);
-            }
-
-            _ => self.send_error(
-                client,
-                ErrorCode::InvalidRequest,
-                "unsupported request".to_string(),
-                instruction.id,
-            ),
-        }
-    }
-
-    fn process_account_subscribe(&mut self, client: u64, instruction: &Instruction) {
-        let pubkey = instruction.get_pubkey();
-
-        // Check that the instruction includes a PubKey.
-        if let Some(pubkey) = pubkey {
-            self.process_account_subscribe_with_pubkey(client, instruction, pubkey);
-        } else {
-            self.send_pubkey_missing_error(client, instruction.id);
-        }
-    }
-
-    fn send_error(&mut self, client: u64, code: ErrorCode, message: String, id: i64) {
-        // Send an error message back to the client.
-        let got = {
-            let clients = self.client_senders.lock().unwrap();
-            clients.get(&client).map(|v| v.clone())
-        };
-        if let Some(sender) = got {
-            // TODO: How should we handle channel write failures?
-            if let Err(err) = sender.send(ServerToClient::Error(Error {
-                jsonrpc: "2.0".to_string(),
-                code,
-                message,
-                id,
-            })) {
-                error!(
-                    client_id = client,
-                    subscription_reply_channel_error = err.to_string().as_str()
-                );
-            }
-        }
-    }
-
-    fn send_pubkey_missing_error(&mut self, client: u64, id: i64) {
-        self.send_error(
-            client,
-            ErrorCode::InvalidParams,
-            "unable to parse PublicKey".to_string(),
-            id,
-        );
-    }
-
-    fn process_account_subscribe_with_pubkey(
+    fn process_account_unsubscribe(
         &mut self,
-        client: u64,
-        instruction: &Instruction,
-        pubkey: String,
+        send_to_client: UnboundedSender<ServerToClient>,
+        client: ClientID,
+        request: jsonrpc::Request,
     ) {
-        // If the subscription for that PubKey already exists, then
-        // return the current subscription. Otherwise, add a new
-        // subscription.
-        let subscription = if let Some(subscription) = self.pubkey_to_subscription.get(&pubkey) {
-            *subscription
-        } else {
-            self.process_new_pubkey_subscription(instruction, pubkey)
-        };
-
-        self.add_subscriber(client, subscription, instruction.id)
-    }
-
-    fn process_new_pubkey_subscription(
-        &mut self,
-        instruction: &Instruction,
-        pubkey: String,
-    ) -> i64 {
-        let subscription = self.next_instruction_id;
-        self.pubkey_to_subscription.insert(pubkey, subscription);
-        self.next_instruction_id += 1;
-        let mut instruction = instruction.clone();
-        instruction.id = subscription;
-        for endpoint in self.endpoints.iter() {
-            // TODO: How should we handle channel write failures?
-            if let Err(err) = endpoint.send(ServerToEndpoint::Instruction(instruction.clone())) {
-                error!(endpoint_channel_failure = err.to_string().as_str());
+        let mut to_unsubscribe = None;
+        if let serde_json::Value::Array(params) = request.params {
+            if params.len() == 1 {
+                if let Some(serde_json::Value::Number(num)) = params.get(0) {
+                    to_unsubscribe = num.as_i64();
+                }
             }
         }
-        subscription
+
+        if to_unsubscribe.is_none() {
+            Self::send_error(
+                send_to_client.clone(),
+                jsonrpc::ErrorCode::InvalidParams,
+                "unable to parse unsubscribe parameters".to_string(),
+                request.id,
+            );
+            return;
+        }
+        let to_unsubscribe = ServerInstructionID(to_unsubscribe.unwrap());
+
+        let should_remove_globally = if let Some(subscriptions) =
+            self.client_to_subscriptions.get_mut(&client)
+        {
+            if subscriptions.remove(&to_unsubscribe) {
+                info!(
+                    "pubsub client {} unsubscribing to {}",
+                    client.0, to_unsubscribe.0
+                );
+                Self::send_unsubscribe_response(send_to_client.clone(), request.id);
+
+                // Check to see if we were the last subscriber.
+                if let Some(subscribers) = self.subscription_to_clients.get_mut(&to_unsubscribe) {
+                    subscribers.remove(&Subscriber {
+                        client: client.clone(),
+                        encoding: Encoding::Base64, // Unused in the hash
+                    });
+                    subscribers.len() == 0
+                } else {
+                    true
+                }
+            } else {
+                Self::send_error(
+                    send_to_client.clone(),
+                    jsonrpc::ErrorCode::InvalidRequest,
+                    "not currently subscribed".to_string(),
+                    request.id,
+                );
+                return;
+            }
+        } else {
+            Self::send_error(
+                send_to_client.clone(),
+                jsonrpc::ErrorCode::InvalidRequest,
+                "you have no subscriptions".to_string(),
+                request.id,
+            );
+            return;
+        };
+
+        if should_remove_globally {
+            self.remove_global_subscription(to_unsubscribe);
+        }
     }
 
-    fn add_subscriber(&mut self, client: u64, subscription: i64, original_id: i64) {
-        let got = {
-            let clients = self.client_senders.lock().unwrap();
-            clients.get(&client).map(|v| v.clone())
-        };
-        if let Some(sender) = got {
-            // Add the client to the current list of subscribers.
-            {
-                let mut subscriptions = self.subscription_to_client.lock().unwrap();
-                subscriptions
-                    .entry(subscription)
-                    .or_insert(HashSet::new())
-                    .insert(client);
-            }
+    fn process_account_subscribe(
+        &mut self,
+        send_to_client: UnboundedSender<ServerToClient>,
+        client: ClientID,
+        request: jsonrpc::Request,
+    ) {
+        if let serde_json::Value::Array(mut params) = request.params {
+            if let Some(serde_json::Value::String(pubkey)) = params.get(0) {
+                let pubkey = pubkey.clone();
+                let encoding = if let Some(serde_json::Value::String(val)) =
+                    params.get_mut(1).and_then(|obj| {
+                        if let serde_json::Value::Object(obj) = obj {
+                            obj.get_mut("encoding")
+                        } else {
+                            None
+                        }
+                    }) {
+                    let original = val.clone();
+                    *val = "base64".to_string();
+                    original
+                } else {
+                    "base64".to_string()
+                };
 
-            // Add the subscription for the client.
-            {
-                let mut subscriptions = self.client_to_subscription.lock().unwrap();
-                subscriptions
-                    .entry(client)
-                    .or_insert(HashSet::new())
-                    .insert(subscription);
-            }
-            info!(client_id = client, subscription_id = subscription);
+                let recognized_encoding;
+                match encoding.as_str() {
+                    "base58" => recognized_encoding = Encoding::Base58,
+                    "base64" => recognized_encoding = Encoding::Base64,
+                    "base64+zstd" => recognized_encoding = Encoding::Base64Zstd,
+                    _ => {
+                        Self::send_error(
+                            send_to_client,
+                            jsonrpc::ErrorCode::InvalidParams,
+                            format!("unrecognized encoding {}", encoding),
+                            request.id,
+                        );
+                        return;
+                    }
+                }
 
-            // TODO: How should we handle channel write failures?
-            if let Err(err) = sender.send(ServerToClient::SubscriptionReply(SubscriptionReply {
-                jsonrpc: "2.0".to_string(),
-                result: subscription,
-                id: original_id,
-            })) {
-                error!(
-                    client_id = client,
-                    subscription_reply_channel_error = err.to_string().as_str()
+                // Update bidirectional pubkey mapping.
+                let subscription = self.pubkey_to_subscription.entry(pubkey.clone());
+                let subscription_id = match subscription {
+                    Entry::Occupied(existing) => existing.get().clone(),
+                    Entry::Vacant(put) => {
+                        let current_id = self.next_instruction_id.clone();
+                        self.next_instruction_id.0 += 1;
+                        put.insert(current_id.clone());
+
+                        // In this branch of the code, we need to send a new subscription request.
+                        for endpoint in self.send_to_pubsub.iter() {
+                            endpoint
+                                .send(ServerToPubsub::AccountSubscribe {
+                                    subscription: current_id.clone(),
+                                    pubkey: pubkey.clone(),
+                                })
+                                .expect("pubsub endpoint channel died");
+                        }
+                        for endpoint in self.send_to_http.iter() {
+                            endpoint
+                                .send(ServerToHTTP::AccountSubscribe {
+                                    subscription: current_id.clone(),
+                                    pubkey: pubkey.clone(),
+                                })
+                                .expect("http endpoint channel died");
+                        }
+                        current_id
+                    }
+                };
+
+                info!(
+                    "pubsub client {} subscribing to {} as global id {}",
+                    client.0, &pubkey, subscription_id.0
+                );
+
+                self.subscription_to_pubkey
+                    .insert(subscription_id.clone(), pubkey.clone());
+
+                // Update bidirectional client mapping.
+                match self.client_to_subscriptions.entry(client.clone()) {
+                    Entry::Occupied(mut existing) => {
+                        existing.get_mut().insert(subscription_id.clone());
+                    }
+                    Entry::Vacant(entry) => {
+                        let mut set = HashSet::new();
+                        set.insert(subscription_id.clone());
+                        entry.insert(set);
+                    }
+                }
+
+                let subscriber = Subscriber {
+                    client: client.clone(),
+                    encoding: recognized_encoding,
+                };
+                match self.subscription_to_clients.entry(subscription_id.clone()) {
+                    Entry::Occupied(mut existing) => {
+                        existing.get_mut().insert(subscriber);
+                    }
+                    Entry::Vacant(entry) => {
+                        let mut set = HashSet::new();
+                        set.insert(subscriber);
+                        entry.insert(set);
+                    }
+                }
+
+                Self::send_subscription_response(send_to_client, request.id, subscription_id.0);
+            } else {
+                Self::send_error(
+                    send_to_client,
+                    jsonrpc::ErrorCode::InvalidParams,
+                    "no public key provided".to_string(),
+                    request.id,
                 );
             }
+        } else {
+            Self::send_error(
+                send_to_client,
+                jsonrpc::ErrorCode::InvalidParams,
+                "subscription takes array parameter".to_string(),
+                request.id,
+            );
         }
+    }
+
+    fn send_string(send_to_client: UnboundedSender<ServerToClient>, message: String) {
+        if let Err(err) = send_to_client.send(ServerToClient::Message(message)) {
+            error!("server to client channel failure: {}", err);
+        }
+    }
+
+    fn send_subscription_response(
+        send_to_client: UnboundedSender<ServerToClient>,
+        id: i64,
+        result: i64,
+    ) {
+        let json = serde_json::to_string(&jsonrpc::SubscribeResponse {
+            jsonrpc: "2.0".to_string(),
+            result,
+            id,
+        })
+        .expect("unable to serialize subscription reply to json");
+        Self::send_string(send_to_client, json);
+    }
+
+    fn send_unsubscribe_response(send_to_client: UnboundedSender<ServerToClient>, id: i64) {
+        let json = serde_json::to_string(&jsonrpc::UnsubscribeResponse {
+            jsonrpc: "2.0".to_string(),
+            result: true,
+            id,
+        })
+        .expect("unable to serialize unsubscribe reply to json");
+        Self::send_string(send_to_client, json);
+    }
+
+    fn send_error(
+        send_to_client: UnboundedSender<ServerToClient>,
+        code: jsonrpc::ErrorCode,
+        message: String,
+        id: i64,
+    ) {
+        let json = serde_json::to_string(&jsonrpc::Error {
+            jsonrpc: "2.0".to_string(),
+            code,
+            message,
+            id,
+        })
+        .expect("unable to serialize error to json");
+        Self::send_string(send_to_client, json);
     }
 }

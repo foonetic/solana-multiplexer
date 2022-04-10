@@ -1,16 +1,16 @@
-use crate::messages::*;
-use futures_util::{
-    stream::{SplitSink, SplitStream},
-    SinkExt, StreamExt,
-};
+use crate::{channel_types::*, jsonrpc};
+use futures_util::{stream::SplitStream, SinkExt, StreamExt};
 use std::{
-    collections::HashMap,
-    sync::{Arc, Mutex},
+    collections::{hash_map::Entry, HashMap},
+    sync::Arc,
     time::Duration,
 };
 use tokio::{
     net::TcpStream,
-    sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
+    sync::{
+        mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
+        oneshot,
+    },
     time,
 };
 use tokio_tungstenite::{tungstenite::Message, MaybeTlsStream, WebSocketStream};
@@ -27,379 +27,390 @@ pub enum EndpointConfig {
     PubSub(Url),
 }
 
-/// Receives instructions from the server for a single endpoint. Sends data back
-/// to the server to be arbitrated.
-pub struct EndpointManager {
-    send: UnboundedSender<EndpointToServer>,
-    receive: UnboundedReceiver<ServerToEndpoint>,
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct EndpointSubscriberID(i64);
+
+pub struct PubsubEndpoint {
+    reader: SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>,
+    enqueue: UnboundedSender<Message>,
+    send_to_server: UnboundedSender<EndpointToServer>,
+    receive_from_server: UnboundedReceiver<ServerToPubsub>,
+    global_to_local_subscriber: HashMap<ServerInstructionID, EndpointSubscriberID>,
+    local_to_global_subscriber: HashMap<EndpointSubscriberID, ServerInstructionID>,
 }
 
-/// Spawns processes to listen to the input endpoints. Returns a channel that
-/// the server can use to listen to all endpoint activity, and a vector of
-/// channels that can be used to communicate to all endpoints. Each endpoint is
-/// responsible for ensuring that the returned subscription id echoes the input
-/// id sent by the server.
-pub async fn spawn(
-    config: &[EndpointConfig],
-) -> (
-    UnboundedReceiver<EndpointToServer>,
-    Vec<UnboundedSender<ServerToEndpoint>>,
-) {
-    let (endpoint_to_server, receive_from_endpoints) = unbounded_channel();
-    let http_client = Arc::new(reqwest::Client::new());
-    let mut endpoints = Vec::new();
-    for endpoint in config.iter() {
-        let (server_to_endpoint, receive_from_server) = unbounded_channel();
-        let endpoint_manager = EndpointManager {
-            send: endpoint_to_server.clone(),
-            receive: receive_from_server,
-        };
+impl PubsubEndpoint {
+    pub fn new(
+        ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
+        send_to_server: UnboundedSender<EndpointToServer>,
+        receive_from_server: UnboundedReceiver<ServerToPubsub>,
+    ) -> Self {
+        let (mut writer, reader) = ws.split();
+        let (enqueue, mut dequeue) = unbounded_channel();
 
-        match endpoint {
-            EndpointConfig::HTTP(url, frequency) => {
-                let (url, frequency, http_client) =
-                    (url.clone(), frequency.clone(), http_client.clone());
-                info!(new_http_endpoint = url.as_str());
-                tokio::spawn(async move {
-                    run_http(endpoint_manager, http_client.clone(), url, frequency).await;
-                });
+        tokio::spawn(async move {
+            while let Some(message) = dequeue.recv().await {
+                if let Err(err) = writer.send(message).await {
+                    error!(error_writing_to_client = err.to_string().as_str());
+                    return;
+                }
             }
+        });
 
-            EndpointConfig::PubSub(url) => {
-                info!(new_pubsub_endpoint = url.as_str());
-                let (ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
-                tokio::spawn(async move {
-                    run_pubsub(endpoint_manager, ws).await;
-                });
-            }
+        Self {
+            reader,
+            enqueue,
+            send_to_server,
+            receive_from_server,
+            global_to_local_subscriber: HashMap::new(),
+            local_to_global_subscriber: HashMap::new(),
         }
-
-        endpoints.push(server_to_endpoint);
     }
-    (receive_from_endpoints, endpoints)
-}
 
-/// Manages an HTTP endpoint.
-async fn run_http(
-    mut manager: EndpointManager,
-    client: Arc<reqwest::Client>,
-    url: Url,
-    frequency: Duration,
-) {
-    let mut unsubscribe_by_id = HashMap::new();
-    while let Some(from_server) = manager.receive.recv().await {
-        match from_server {
-            ServerToEndpoint::Instruction(instruction) => match instruction.method {
-                Method::accountSubscribe => {
-                    let unsubscribe = Arc::new(Mutex::new(false));
-                    unsubscribe_by_id.insert(instruction.id, unsubscribe.clone());
-                    let mut instruction = instruction.clone();
-                    instruction.method = Method::getAccountInfo;
-                    info!(new_http_subscription_id = instruction.id);
-                    let instruction = serde_json::to_string(&instruction).unwrap();
-                    let mut endpoint = PollHTTP {
-                        client: client.clone(),
-                        url: url.clone(),
-                        frequency: frequency.clone(),
-                        instruction: instruction,
-                        unsubscribe: unsubscribe.clone(),
-                        send: manager.send.clone(),
-                    };
-                    tokio::spawn(async move {
-                        endpoint.run().await;
-                    });
+    pub async fn run(&mut self) {
+        let mut interval = time::interval(Duration::from_secs(30));
+        loop {
+            tokio::select! {
+                Some(message) = self.receive_from_server.recv() => {
+                    self.on_instruction(message);
                 }
 
-                Method::accountUnsubscribe => {
-                    if let Some(unsubscribe) = unsubscribe_by_id.get(&instruction.id) {
-                        let mut val = unsubscribe.lock().unwrap();
-                        *val = true;
+                message = self.reader.next() => {
+                    if message.is_none() {
+                        return;
                     }
-                    info!(http_unsubscribe_global_id = instruction.id);
-                    unsubscribe_by_id.remove(&instruction.id);
+                    let message = message.unwrap();
+                    if message.is_err() {
+                        return;
+                    }
+                    self.on_message(message.unwrap());
                 }
 
-                _ => {
-                    manager.send_error(
-                        ErrorCode::InvalidRequest,
-                        "unknown instruction".to_string(),
-                        instruction.id,
-                    );
-                }
-            },
-        }
-    }
-}
-
-/// Manages a PubSub endpoint.
-async fn run_pubsub(
-    mut endpoint: EndpointManager,
-    websocket: WebSocketStream<MaybeTlsStream<TcpStream>>,
-) {
-    let (mut to_endpoint, from_endpoint) = websocket.split();
-    let subscription_to_id = Arc::new(Mutex::new(HashMap::new()));
-    let id_to_subscription = Arc::new(Mutex::new(HashMap::new()));
-
-    let mut pubsub = PollPubSub {
-        from_endpoint,
-        subscription_to_id: subscription_to_id.clone(),
-        send: endpoint.send.clone(),
-        id_to_subscription: id_to_subscription.clone(),
-    };
-    tokio::spawn(async move {
-        pubsub.run().await;
-    });
-
-    let mut interval = time::interval(Duration::from_secs(30));
-    loop {
-        tokio::select! {
-            Some(from_server) = endpoint.receive.recv() => {
-                endpoint.on_server_message(
-                    from_server,
-                    &mut to_endpoint,
-                    id_to_subscription.clone(),
-                    subscription_to_id.clone()
-                ).await;
-            }
-
-            _ = interval.tick() => {
-                let instruction = "";
-                if let Err(err) = to_endpoint.send(Message::from(instruction)).await {
-                    error!(instruction_to_endpoint_channel_failure = err.to_string().as_str());
-                }
-            }
-        }
-    }
-}
-
-impl EndpointManager {
-    async fn on_server_message(
-        &mut self,
-        from_server: ServerToEndpoint,
-        to_endpoint: &mut SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>,
-        id_to_subscription: Arc<Mutex<HashMap<i64, i64>>>,
-        subscription_to_id: Arc<Mutex<HashMap<i64, i64>>>,
-    ) {
-        match from_server {
-            ServerToEndpoint::Instruction(instruction) => match instruction.method {
-                Method::accountSubscribe => {
-                    let instruction = serde_json::to_string(&instruction).unwrap();
-                    if let Err(err) = to_endpoint.send(Message::from(instruction)).await {
-                        error!(instruction_to_endpoint_channel_failure = err.to_string().as_str());
+                _ = interval.tick() => {
+                    if let Err(err) = self.enqueue.send(Message::Ping(vec![0])) {
+                        error!("pubsub endpoint failed to ping: {}", err);
                     }
                 }
-
-                Method::accountUnsubscribe => {
-                    if let Some(id) = instruction.get_integer() {
-                        let unsubscribe = {
-                            let id_to_subscription = id_to_subscription.lock().unwrap();
-                            id_to_subscription.get(&id).map(|v| *v)
-                        };
-                        if let Some(unsubscribe) = unsubscribe {
-                            let mut instruction = instruction.clone();
-                            instruction.set_integer(unsubscribe);
-
-                            info!(
-                                pubsub_unsubscribe_request_id = instruction.id,
-                                subscription = unsubscribe,
-                                global_id = id
-                            );
-                            let instruction = serde_json::to_string(&instruction).unwrap();
-
-                            if let Err(err) = to_endpoint.send(Message::from(instruction)).await {
-                                error!(
-                                    instruction_to_endpoint_channel_failure =
-                                        err.to_string().as_str()
-                                );
-                            }
-
-                            // Remove account tracking.
-                            {
-                                let mut id_to_subscription = id_to_subscription.lock().unwrap();
-                                let mut subscription_to_id = subscription_to_id.lock().unwrap();
-                                id_to_subscription.remove(&id);
-                                subscription_to_id.remove(&unsubscribe);
-                            }
-                        }
-                    } else {
-                        self.send_error(
-                            ErrorCode::InvalidRequest,
-                            "invalid unsubscribe request".to_string(),
-                            instruction.id,
-                        );
-                    }
-                }
-
-                _ => {
-                    self.send_error(
-                        ErrorCode::InvalidRequest,
-                        "unknown instruction".to_string(),
-                        instruction.id,
-                    );
-                }
-            },
-        }
-    }
-
-    fn send_error(&mut self, code: ErrorCode, message: String, id: i64) {
-        // TODO: How should we handle channel write failures?
-        if let Err(err) = self.send.send(EndpointToServer::Error(Error {
-            jsonrpc: "2.0".to_string(),
-            code,
-            message,
-            id,
-        })) {
-            error!(
-                request_id = id,
-                subscription_reply_channel_error = err.to_string().as_str()
-            );
-        }
-    }
-}
-
-/// Polls messages from the PubSub endpoint and passes them to the server as
-/// needed. Subscription replies do not need to be passes back to the server
-/// since the endpoint is responsible for managing those subscriptions. The
-/// server will always reply with the logical global subscription id rather than
-/// each endpoint's specific subscription id.
-struct PollPubSub {
-    from_endpoint: SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>,
-    subscription_to_id: Arc<Mutex<HashMap<i64, i64>>>,
-    send: UnboundedSender<EndpointToServer>,
-    id_to_subscription: Arc<Mutex<HashMap<i64, i64>>>,
-}
-
-impl PollPubSub {
-    async fn run(&mut self) {
-        while let Some(from_endpoint) = self.from_endpoint.next().await {
-            let data = from_endpoint;
-            if data.is_err() {
-                error!(pubsub_read_failure = data.unwrap_err().to_string().as_str());
-                continue;
-            }
-            let data = data.unwrap().into_text();
-            if data.is_err() {
-                error!(pubsub_read_failure = data.unwrap_err().to_string().as_str());
-                continue;
-            }
-            let data = data.unwrap();
-
-            if let Ok(account_notification) = serde_json::from_str::<AccountNotification>(&data) {
-                self.on_account_notification(&account_notification);
-            } else if let Ok(subscription_reply) = serde_json::from_str::<SubscriptionReply>(&data)
-            {
-                self.on_subscription_reply(&subscription_reply);
-            } else if let Ok(unsubscribe_reply) = serde_json::from_str::<UnsubscribeReply>(&data) {
-                self.on_unsubscribe(&unsubscribe_reply);
             }
         }
     }
 
-    fn on_unsubscribe(&mut self, unsubscribe: &UnsubscribeReply) {
-        info!(pubsub_unsubscribe_request_id_acknowledged = unsubscribe.id);
+    fn on_message(&mut self, message: Message) {
+        match message {
+            Message::Text(msg) => self.on_text_message(msg),
+            Message::Binary(msg) => self.on_binary_message(msg),
+            Message::Ping(_msg) => {
+                // No need to send a reply: tungstenite takes care of this for you.
+            }
+            Message::Pong(_msg) => {
+                // Ignore: assume all pongs are valid.
+            }
+            Message::Close(_msg) => {
+                // No need to send reply; this is handled by the library.
+            }
+            Message::Frame(_msg) => {
+                unreachable!();
+            }
+        }
     }
 
-    fn on_account_notification(&mut self, account_notification: &AccountNotification) {
-        let id = {
-            let subscription_to_id = self.subscription_to_id.lock().unwrap();
-            subscription_to_id
-                .get(&account_notification.params.subscription)
-                .map(|v| *v)
-        };
+    fn on_text_message(&mut self, message: String) {
+        if let Ok(reply) = serde_json::from_str(&message) {
+            self.on_json(reply);
+        }
+    }
 
-        if let Some(id) = id {
-            let mut account_notification = account_notification.clone();
-            account_notification.params.subscription = id;
+    fn on_binary_message(&mut self, message: Vec<u8>) {
+        if let Ok(reply) = serde_json::from_slice(&message) {
+            self.on_json(reply);
+        }
+    }
+
+    fn on_json(&mut self, value: serde_json::Value) {
+        // Check for subscription and method. These fields indicate the type of
+        // response that should be sent back.
+        if let Ok(notification) =
+            serde_json::from_value::<jsonrpc::AccountNotification>(value.clone())
+        {
+            self.on_account_notification(notification)
+        } else if let Ok(reply) = serde_json::from_value::<jsonrpc::SubscribeResponse>(value) {
+            self.on_subscribe_reply(reply);
+        }
+    }
+
+    fn on_account_notification(&mut self, mut reply: jsonrpc::AccountNotification) {
+        if let Some(id) = self
+            .local_to_global_subscriber
+            .get(&EndpointSubscriberID(reply.params.subscription))
+        {
+            reply.params.subscription = id.0;
             if let Err(err) = self
-                .send
-                .send(EndpointToServer::AccountNotification(account_notification))
+                .send_to_server
+                .send(EndpointToServer::AccountNotification(reply))
             {
-                error!(
-                    pubsub_to_server_channel_failure = err.to_string().as_str(),
-                    subscription_id = id
-                );
+                error!(unable_to_enqueue_account_notification = err.to_string().as_str());
             }
         }
     }
 
-    fn on_subscription_reply(&mut self, subscription_reply: &SubscriptionReply) {
-        // Map to and from the subscription id returned by the
-        // endpoint. This will be needed to translate replies into
-        // the global id, and also to unsubscribe.
-        {
-            let mut id_to_subscription = self.id_to_subscription.lock().unwrap();
-            id_to_subscription.insert(subscription_reply.id, subscription_reply.result);
-        }
-        {
-            let mut subscription_to_id = self.subscription_to_id.lock().unwrap();
-            subscription_to_id.insert(subscription_reply.result, subscription_reply.id);
-        }
-        info!(
-            new_pubsub_global_id = subscription_reply.id,
-            new_pubsub_subscription_id = subscription_reply.result
+    fn on_subscribe_reply(&mut self, reply: jsonrpc::SubscribeResponse) {
+        self.global_to_local_subscriber.insert(
+            ServerInstructionID(reply.id),
+            EndpointSubscriberID(reply.result),
         );
+        self.local_to_global_subscriber.insert(
+            EndpointSubscriberID(reply.result),
+            ServerInstructionID(reply.id),
+        );
+    }
+
+    fn on_instruction(&mut self, message: ServerToPubsub) {
+        match message {
+            ServerToPubsub::AccountSubscribe {
+                subscription,
+                pubkey,
+            } => {
+                info!(
+                    "pubsub endpoint subscribing to {} as global id {}",
+                    &pubkey, subscription.0
+                );
+                let instruction = format!(
+                    r#"{{"jsonrpc":"2.0","id":{},"method":"accountSubscribe","params":["{}",{{"encoding":"base64","commitment":"confirmed"}}]}}"#,
+                    subscription.0, pubkey
+                );
+                if let Err(err) = self.enqueue.send(Message::Text(instruction)) {
+                    error!("failed to enqueue pubsub write: {}", err);
+                }
+            }
+
+            ServerToPubsub::AccountUnsubscribe {
+                request_id,
+                subscription,
+            } => {
+                let entry = self.global_to_local_subscriber.entry(subscription.clone());
+                match entry {
+                    Entry::Occupied(got) => {
+                        info!(
+                            "pubsub endpoint unsubscribing to global id {}",
+                            subscription.0,
+                        );
+                        let instruction = format!(
+                            r#"{{"jsonrpc":"2.0","id":{},"method":"accountUnsubscribe","params":[{}]}}"#,
+                            request_id.0,
+                            got.get().0,
+                        );
+                        if let Err(err) = self.enqueue.send(Message::Text(instruction)) {
+                            error!("failed to enqueue pubsub write: {}", err);
+                        }
+                        self.local_to_global_subscriber.remove(got.get());
+                        got.remove();
+                    }
+                    Entry::Vacant(_) => {}
+                }
+            }
+        }
     }
 }
 
 /// Regularly polls an HTTP endpoint at some configured frequency.
-struct PollHTTP {
+struct HTTPPoll {
     client: Arc<reqwest::Client>,
     url: Url,
     frequency: Duration,
     instruction: String,
-    unsubscribe: Arc<Mutex<bool>>,
+    unsubscribe: oneshot::Receiver<bool>,
     send: UnboundedSender<EndpointToServer>,
 }
 
-impl PollHTTP {
+impl HTTPPoll {
+    fn new(
+        client: Arc<reqwest::Client>,
+        url: Url,
+        frequency: Duration,
+        instruction: String,
+        unsubscribe: oneshot::Receiver<bool>,
+        send: UnboundedSender<EndpointToServer>,
+    ) -> Self {
+        HTTPPoll {
+            client,
+            url,
+            frequency,
+            instruction,
+            unsubscribe,
+            send,
+        }
+    }
+
     async fn run(&mut self) {
         let mut interval = time::interval(self.frequency);
         loop {
-            // If we are unsubscribed, quit.
-            {
-                if *self.unsubscribe.lock().unwrap() {
+            tokio::select! {
+                Ok(_) = &mut self.unsubscribe => {
+                    info!("http endpoint {} halting poll", self.url.as_str());
                     return;
                 }
+                _ = interval.tick() => {
+                    self.query().await;
+                }
             }
+        }
+    }
 
-            if let Ok(result) = self
-                .client
-                .post(self.url.clone())
-                .body(self.instruction.clone())
-                .header("content-type", "application/json")
-                .send()
-                .await
-            {
-                if let Ok(text) = result.text().await {
-                    if let Ok(account_info) = serde_json::from_str::<AccountInfo>(&text) {
-                        // The websocket account notification has a
-                        // different format from the getAccountInfo RPC
-                        // endpoint. Reformat everything to look like the
-                        // websocket format. Downstream clients will only
-                        // subscribe to the websocket.
-                        let notification = AccountNotification {
-                            jsonrpc: account_info.jsonrpc,
-                            method: Method::accountNotification,
-                            params: NotificationParams {
-                                result: account_info.result,
-                                subscription: account_info.id,
-                            },
-                        };
-                        // Let the query fail since we will retry momentarily.
-                        // TODO: Limit retries, throttle.
-                        if let Err(err) = self
-                            .send
-                            .send(EndpointToServer::AccountNotification(notification))
-                        {
-                            error!(
-                                http_endpoint = self.url.as_str(),
-                                poll_failure = err.to_string().as_str()
-                            );
-                        }
+    async fn query(&mut self) {
+        if let Ok(result) = self
+            .client
+            .post(self.url.clone())
+            .body(self.instruction.clone())
+            .header("content-type", "application/json")
+            .send()
+            .await
+        {
+            if let Ok(text) = result.text().await {
+                if let Ok(account_info) = serde_json::from_str::<jsonrpc::AccountInfo>(&text) {
+                    // The websocket account notification has a
+                    // different format from the getAccountInfo RPC
+                    // endpoint. Reformat everything to look like the
+                    // websocket format. Downstream clients will only
+                    // subscribe to the websocket.
+                    let notification = jsonrpc::AccountNotification {
+                        jsonrpc: account_info.jsonrpc,
+                        method: "accountNotification".to_string(),
+                        params: jsonrpc::AccountNotificationParams {
+                            result: account_info.result,
+                            subscription: account_info.id,
+                        },
+                    };
+                    // Let the query fail since we will retry momentarily.
+                    // TODO: Limit retries, throttle.
+                    if let Err(err) = self
+                        .send
+                        .send(EndpointToServer::AccountNotification(notification))
+                    {
+                        error!(
+                            "http endpoint {} failed to poll: {}",
+                            self.url.as_str(),
+                            err
+                        );
                     }
                 }
             }
-            interval.tick().await;
+        }
+    }
+}
+
+pub struct HTTPEndpoint {
+    client: Arc<reqwest::Client>,
+    url: Url,
+    frequency: Duration,
+    send_to_server: UnboundedSender<EndpointToServer>,
+    receive_from_server: UnboundedReceiver<ServerToHTTP>,
+    account_unsubscribe: HashMap<ServerInstructionID, oneshot::Sender<bool>>,
+}
+
+impl HTTPEndpoint {
+    pub fn new(
+        client: Arc<reqwest::Client>,
+        url: Url,
+        frequency: Duration,
+        send_to_server: UnboundedSender<EndpointToServer>,
+        receive_from_server: UnboundedReceiver<ServerToHTTP>,
+    ) -> Self {
+        Self {
+            client,
+            url,
+            frequency,
+            send_to_server,
+            receive_from_server,
+            account_unsubscribe: HashMap::new(),
+        }
+    }
+
+    pub async fn run(&mut self) {
+        loop {
+            self.poll().await;
+        }
+    }
+
+    async fn poll(&mut self) {
+        tokio::select! {
+            Some(message) = self.receive_from_server.recv() => {
+                self.on_message(message);
+            }
+        }
+    }
+
+    fn on_message(&mut self, message: ServerToHTTP) {
+        match message {
+            ServerToHTTP::AccountSubscribe {
+                subscription,
+                pubkey,
+            } => {
+                info!(
+                    "http endpoint {} subscribing to pubkey {} as global id {}",
+                    self.url.as_str(),
+                    &pubkey,
+                    subscription.0,
+                );
+                let (send_unsubscribe, receive_unsubscribe) = oneshot::channel();
+                self.account_unsubscribe
+                    .insert(subscription.clone(), send_unsubscribe);
+                let instruction = format!(
+                    r#"{{"jsonrpc":"2.0","id":{},"method":"getAccountInfo","params":["{}",{{"encoding":"base64","commitment":"confirmed"}}]}}"#,
+                    subscription.0, pubkey
+                );
+                let mut poll = HTTPPoll::new(
+                    self.client.clone(),
+                    self.url.clone(),
+                    self.frequency.clone(),
+                    instruction,
+                    receive_unsubscribe,
+                    self.send_to_server.clone(),
+                );
+                tokio::spawn(async move {
+                    poll.run().await;
+                });
+            }
+
+            ServerToHTTP::AccountUnsubscribe(subscription) => {
+                info!(
+                    "http endpoint {} unsubscribing to global id {}",
+                    self.url.as_str(),
+                    subscription.0,
+                );
+
+                let entry = self.account_unsubscribe.entry(subscription);
+                match entry {
+                    Entry::Occupied(got) => {
+                        if let Err(err) = got.remove().send(true) {
+                            error!("failed to send http unsubscribe through channel: {}", err);
+                        }
+                    }
+                    Entry::Vacant(_) => {}
+                }
+            }
+
+            ServerToHTTP::DirectRequest(request, sender) => {
+                info!("http endpoint {} issuing direct request", self.url.as_str(),);
+                let client = self.client.clone();
+                let url = self.url.clone();
+                let body =
+                    serde_json::to_string(&request).expect("unable to serialize json request");
+                tokio::spawn(async move {
+                    if let Ok(result) = client
+                        .post(url)
+                        .body(body)
+                        .header("content-type", "application/json")
+                        .send()
+                        .await
+                    {
+                        if let Ok(text) = result.text().await {
+                            if let Err(err) = sender.send(ServerToClient::Message(text)) {
+                                error!("direct http request failed: {}", err);
+                            }
+                        }
+                    }
+                });
+            }
         }
     }
 }

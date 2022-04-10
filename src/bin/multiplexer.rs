@@ -20,7 +20,7 @@ struct Args {
     ])]
     endpoint: Vec<String>,
 
-    #[clap(long, default_value = "0.0.0:8900")]
+    #[clap(long, default_value = "0.0.0.0:8900")]
     listen_address: String,
 
     #[clap(long, default_value = "200")]
@@ -57,8 +57,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .collect();
 
-    let mut server = Server::new(&endpoints, &args.listen_address).await;
-    server.run().await;
+    let mut server = Server::new();
+    if let Err(err) = server.run(&endpoints, &args.listen_address).await {
+        panic!("{}", err);
+    }
 
     Ok(())
 }

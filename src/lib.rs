@@ -1,9 +1,6 @@
-mod arbitrator;
+mod client;
 mod endpoint;
-mod listener;
-mod messages;
+mod jsonrpc;
 pub mod server;
-pub use {
-    endpoint::{spawn, EndpointConfig},
-    server::Server,
-};
+mod channel_types;
+pub use {endpoint::EndpointConfig, server::Server};

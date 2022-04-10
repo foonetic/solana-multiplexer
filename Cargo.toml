@@ -13,8 +13,12 @@ path = "src/bin/multiplexer.rs"
 path = "src/lib.rs"
 
 [dependencies]
+base64 = "0.13.0"
+bs58 = "0.4"
 clap = {version = "3.1.7", features = ["derive"]}
 futures-util = "0.3.21"
+hyper = {version = "0.14.18", features = ["full"]}
+hyper-tungstenite = "0.6.0"
 reqwest = "0.11.0"
 serde = {version = "1.0", features = ["derive"]}
 serde_json = "1.0"
@@ -22,5 +26,6 @@ serde_repr = "0.1"
 tokio = {version = "1.17.0", features = ["full"]}
 tokio-tungstenite = {version = "0.17.1", features = ["native-tls"]}
 tracing = "0.1"
-tracing-subscriber = "0.2"
+tracing-subscriber = "0.3.10"
 url = "2.2.2"
+zstd = "0.11.1"

@@ -3,10 +3,11 @@ use crate::{
     client::ClientHandler,
     endpoint::{self, EndpointConfig},
     jsonrpc,
+    subscription_tracker::{ConstructFromClientID, SubscriptionTracker},
 };
 use hyper::service::{make_service_fn, service_fn};
 use std::{
-    collections::{hash_map::Entry, HashMap, HashSet},
+    collections::{hash_map::Entry, HashMap},
     hash::{Hash, Hasher},
     sync::Arc,
 };
@@ -14,158 +15,29 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tracing::{error, info};
 
 #[derive(Clone, Debug, Eq)]
-struct Subscriber {
+struct AccountSubscription {
     client: ClientID,
     encoding: Encoding,
 }
 
-impl Hash for Subscriber {
+impl ConstructFromClientID for AccountSubscription {
+    fn from_client_id(id: &ClientID) -> Self {
+        Self {
+            client: id.clone(),
+            encoding: Encoding::Base58, // Arbitrary since this isn't part of the hash.
+        }
+    }
+}
+
+impl Hash for AccountSubscription {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.client.hash(state);
     }
 }
 
-impl PartialEq for Subscriber {
+impl PartialEq for AccountSubscription {
     fn eq(&self, other: &Self) -> bool {
         self.client == other.client
-    }
-}
-
-struct AccountSubscriptionTracker {
-    client_to_subscriptions: HashMap<ClientID, HashSet<ServerInstructionID>>,
-    subscription_to_clients: HashMap<ServerInstructionID, HashSet<Subscriber>>,
-    account_notifications: HashMap<ServerInstructionID, u64>,
-}
-
-impl AccountSubscriptionTracker {
-    fn new() -> Self {
-        Self {
-            client_to_subscriptions: HashMap::new(),
-            subscription_to_clients: HashMap::new(),
-            account_notifications: HashMap::new(),
-        }
-    }
-
-    fn track_subscriber(
-        &mut self,
-        client: &ClientID,
-        subscription: &ServerInstructionID,
-        subscriber: Subscriber,
-    ) {
-        match self.client_to_subscriptions.entry(client.clone()) {
-            Entry::Occupied(mut existing) => {
-                existing.get_mut().insert(subscription.clone());
-            }
-            Entry::Vacant(entry) => {
-                let mut set = HashSet::new();
-                set.insert(subscription.clone());
-                entry.insert(set);
-            }
-        }
-
-        match self.subscription_to_clients.entry(subscription.clone()) {
-            Entry::Occupied(mut existing) => {
-                existing.get_mut().insert(subscriber);
-            }
-            Entry::Vacant(entry) => {
-                let mut set = HashSet::new();
-                set.insert(subscriber);
-                entry.insert(set);
-            }
-        }
-    }
-
-    /// Returns true if the notification should be broadcasted. This is the case
-    /// if the subscription is new or has a later slot than any existing notification.
-    fn notification_is_most_recent(&mut self, notification: &jsonrpc::AccountNotification) -> bool {
-        let latest = self
-            .account_notifications
-            .entry(ServerInstructionID(notification.params.subscription));
-        match latest {
-            Entry::Vacant(entry) => {
-                entry.insert(notification.params.result.context.slot);
-                true
-            }
-            Entry::Occupied(mut existing) => {
-                if *existing.get() < notification.params.result.context.slot {
-                    existing.insert(notification.params.result.context.slot);
-                    true
-                } else {
-                    false
-                }
-            }
-        }
-    }
-
-    fn get_notification_subscribers(
-        &self,
-        notification: &jsonrpc::AccountNotification,
-    ) -> Option<&HashSet<Subscriber>> {
-        self.subscription_to_clients
-            .get(&ServerInstructionID(notification.params.subscription))
-    }
-
-    /// Removes a single subscription for a client. Returns true if that
-    /// subscription should be removed globally or false if it should remain.
-    /// Returns None if the client wasn't subscribed.
-    fn remove_single_subscription(
-        &mut self,
-        client: &ClientID,
-        subscription: &ServerInstructionID,
-    ) -> Option<bool> {
-        Self::remove_single_subscription_from_map(
-            &mut self.subscription_to_clients,
-            client,
-            subscription,
-        )
-    }
-
-    fn remove_single_subscription_from_map(
-        subscription_to_clients: &mut HashMap<ServerInstructionID, HashSet<Subscriber>>,
-        client: &ClientID,
-        subscription: &ServerInstructionID,
-    ) -> Option<bool> {
-        if let Entry::Occupied(mut entry) = subscription_to_clients.entry(subscription.clone()) {
-            let subscribed_clients = entry.get_mut();
-            if !subscribed_clients.remove(&Subscriber {
-                client: client.clone(),
-                encoding: Encoding::Base58, // Arbitrary; not hashed or compared.
-            }) {
-                return None;
-            }
-            if subscribed_clients.len() == 0 {
-                entry.remove();
-
-                // There aren't any subscribers remaining.
-                return Some(true);
-            } else {
-                // There are still subscribers remaining.
-                return Some(false);
-            }
-        } else {
-            None
-        }
-    }
-
-    /// Removes a client and returns all subscriptions that should be
-    /// unsubscribed as a result.
-    fn remove_client(&mut self, client: &ClientID) -> Vec<ServerInstructionID> {
-        let mut to_unsubscribe = Vec::new();
-        if let Some(subscriptions) = self.client_to_subscriptions.get(client) {
-            for subscription in subscriptions.iter() {
-                if let Some(should_remove) = Self::remove_single_subscription_from_map(
-                    &mut self.subscription_to_clients,
-                    client,
-                    &subscription.clone(),
-                ) {
-                    if should_remove {
-                        to_unsubscribe.push(subscription.clone());
-                    }
-                }
-            }
-        }
-        self.client_to_subscriptions.remove(&client);
-        to_unsubscribe
     }
 }
 
@@ -183,7 +55,7 @@ pub struct Server {
     send_to_pubsub: Vec<UnboundedSender<ServerToPubsub>>,
     send_to_client: HashMap<ClientID, UnboundedSender<ServerToClient>>,
 
-    account_subscription_tracker: AccountSubscriptionTracker,
+    account_subscription_tracker: SubscriptionTracker<AccountSubscription>,
     pubkey_to_subscription: HashMap<String, ServerInstructionID>,
     subscription_to_pubkey: HashMap<ServerInstructionID, String>,
 }
@@ -205,7 +77,7 @@ impl Server {
             send_to_http: Vec::new(),
             send_to_pubsub: Vec::new(),
             send_to_client: HashMap::new(),
-            account_subscription_tracker: AccountSubscriptionTracker::new(),
+            account_subscription_tracker: SubscriptionTracker::new(),
             pubkey_to_subscription: HashMap::new(),
             subscription_to_pubkey: HashMap::new(),
         }
@@ -682,7 +554,7 @@ impl Server {
                     .insert(subscription_id.clone(), pubkey.clone());
 
                 // Update bidirectional client mapping.
-                let subscriber = Subscriber {
+                let subscriber = AccountSubscription {
                     client: client.clone(),
                     encoding: recognized_encoding,
                 };

@@ -19,7 +19,7 @@ The following subset of PubSub subscriptions is supported:
 - slotSubscribe
 - rootSubscribe
 
-In addition, as a special case, HTTP endpoints will poll accounts subscribe via
+In addition, as a special case, HTTP endpoints will poll accounts subscribed via
 accountSubscribe at a specified frequency until the subscription is cancelled.
 The HTTP and PubSub notifications are then arbitrated and returned via the
 standard WebSocket notification format.

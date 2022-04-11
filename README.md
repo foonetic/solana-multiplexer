@@ -7,8 +7,8 @@ the responses by slot number. The multiplexer may be useful for situations where
 a client would like to access the lowest latency account data among a large pool
 of RPC nodes.
 
-The multiplexer currently supports all JSON RPC requests by forwarding
-round-robin to a single HTTP endpoint.
+The multiplexer currently supports all JSON HTTP RPC requests (i.e. including 
+transactions) by forwarding round-robin to a single HTTP endpoint.
 
 The following subset of PubSub subscriptions is supported:
 

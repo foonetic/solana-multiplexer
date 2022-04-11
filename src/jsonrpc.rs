@@ -27,7 +27,7 @@ pub struct Request {
     pub jsonrpc: String,
     pub id: i64,
     pub method: String,
-    pub params: serde_json::Value,
+    pub params: Option<serde_json::Value>,
 }
 
 /// Generic JSONRPC HTTP response.

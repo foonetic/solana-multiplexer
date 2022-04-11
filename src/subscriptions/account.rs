@@ -82,7 +82,7 @@ impl SubscriptionHandler<Subscription, Metadata> for AccountSubscriptionHandler 
     /// Parses the user-specified pubkey and optional encoding and commitment.
     /// Encoding defaults to base64 and commitment defaults to finalized.
     fn parse_subscription(request: &jsonrpc::Request) -> Result<(Subscription, Metadata), String> {
-        let params = if let serde_json::Value::Array(params) = &request.params {
+        let params = if let Some(serde_json::Value::Array(params)) = &request.params {
             Some(params)
         } else {
             None

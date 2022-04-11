@@ -28,14 +28,10 @@ impl SignatureSubscriptionHandler {
 
 pub struct FormatState {}
 
-impl SubscriptionHandler<Subscription, Metadata>
-    for SignatureSubscriptionHandler
-{
+impl SubscriptionHandler<Subscription, Metadata> for SignatureSubscriptionHandler {
     type FormatState = FormatState;
 
-    fn tracker_mut(
-        &mut self,
-    ) -> &mut SubscriptionTracker<Subscription, Metadata> {
+    fn tracker_mut(&mut self) -> &mut SubscriptionTracker<Subscription, Metadata> {
         &mut self.tracker
     }
 
@@ -66,7 +62,7 @@ impl SubscriptionHandler<Subscription, Metadata>
     }
 
     fn parse_subscription(request: &jsonrpc::Request) -> Result<(Subscription, Metadata), String> {
-        let params = if let serde_json::Value::Array(params) = &request.params {
+        let params = if let Some(serde_json::Value::Array(params)) = &request.params {
             Some(params)
         } else {
             None

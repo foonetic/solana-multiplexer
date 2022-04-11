@@ -99,7 +99,7 @@ impl SubscriptionHandler<Subscription, Metadata> for ProgramSubscriptionHandler 
     }
 
     fn parse_subscription(request: &jsonrpc::Request) -> Result<(Subscription, Metadata), String> {
-        let params = if let serde_json::Value::Array(params) = &request.params {
+        let params = if let Some(serde_json::Value::Array(params)) = &request.params {
             Some(params)
         } else {
             None

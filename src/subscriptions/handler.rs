@@ -165,7 +165,7 @@ pub trait SubscriptionHandler<Subscription: Eq + Hash + Clone, Metadata: Eq + Ha
         http_senders: &[UnboundedSender<ServerToHTTP>],
     ) {
         let mut to_unsubscribe = None;
-        if let serde_json::Value::Array(params) = &request.params {
+        if let Some(serde_json::Value::Array(params)) = &request.params {
             if params.len() == 1 {
                 if let Some(serde_json::Value::Number(num)) = params.get(0) {
                     to_unsubscribe = num.as_i64();

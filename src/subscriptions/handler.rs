@@ -254,6 +254,14 @@ pub trait SubscriptionHandler<Subscription: Eq + Hash + Clone, Metadata: Eq + Ha
         }
     }
 
+    /// Returns a unique key for the given notification. A notification will
+    /// broadcast if it is more recent than anything previously broadcasted, and
+    /// the unique key is None or different from the previously broadcasted
+    /// unique key.
+    fn notification_unique_key(_notification: &jsonrpc::Notification) -> Option<String> {
+        None
+    }
+
     /// Broadcasts a notification to all subscribed clients. The handler is
     /// responsible for transforming the notification into the raw JSONRPC
     /// replies that will be forwarded per each client's configured
@@ -265,10 +273,11 @@ pub trait SubscriptionHandler<Subscription: Eq + Hash + Clone, Metadata: Eq + Ha
     ) {
         if let Some(timestamp) = Self::get_notification_timestamp(&notification) {
             let id = ServerInstructionID(notification.params.subscription);
-            if self
-                .tracker_mut()
-                .notification_is_most_recent(&id, timestamp)
-            {
+            if self.tracker_mut().notification_should_broadcast(
+                &id,
+                timestamp,
+                Self::notification_unique_key(&notification),
+            ) {
                 if let Some(subscriptions) = self.tracker_mut().get_notification_subscribers(&id) {
                     let mut cache: HashMap<Subscription, String> = HashMap::new();
                     let mut format_state = None;

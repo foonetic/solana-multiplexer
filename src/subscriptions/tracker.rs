@@ -28,7 +28,7 @@ impl<S: Eq + Hash> PartialEq for Subscription<S> {
 pub struct SubscriptionTracker<S: Eq + Hash, M: Eq + Hash + Clone> {
     client_to_subscriptions: HashMap<ClientID, HashSet<ServerInstructionID>>,
     subscription_to_clients: HashMap<ServerInstructionID, HashSet<Subscription<S>>>,
-    latest_timestamp_seen: HashMap<ServerInstructionID, u64>,
+    last_payload_seen: HashMap<ServerInstructionID, (u64, Option<String>)>,
 
     /// Subscriptions with the same metadata are considered equivalent, and will
     /// not result in a new subscription. For example, an account subscription
@@ -43,7 +43,7 @@ impl<S: Eq + Hash, M: Eq + Hash + Clone> SubscriptionTracker<S, M> {
         Self {
             client_to_subscriptions: HashMap::new(),
             subscription_to_clients: HashMap::new(),
-            latest_timestamp_seen: HashMap::new(),
+            last_payload_seen: HashMap::new(),
             metadata_to_subscription: HashMap::new(),
             subscription_to_metadata: HashMap::new(),
         }
@@ -111,25 +111,48 @@ impl<S: Eq + Hash, M: Eq + Hash + Clone> SubscriptionTracker<S, M> {
     }
 
     /// Returns true if the notification should be broadcasted. This is the case
-    /// if the subscription is new or has a later slot than any existing notification.
-    pub fn notification_is_most_recent(
+    /// if the subscription is new or has a later slot than any existing
+    /// notification, and if the payload has changed.
+    pub fn notification_should_broadcast(
         &mut self,
         subscription: &ServerInstructionID,
         timestamp: u64,
+        payload: Option<String>,
     ) -> bool {
-        let latest = self.latest_timestamp_seen.entry(subscription.clone());
+        let latest = self.last_payload_seen.entry(subscription.clone());
         match latest {
+            // Never seen data for this subscription before, so return.
             Entry::Vacant(entry) => {
-                entry.insert(timestamp);
-                true
+                entry.insert((timestamp, payload));
+                return true;
             }
             Entry::Occupied(mut existing) => {
-                if *existing.get() < timestamp {
-                    existing.insert(timestamp);
-                    true
-                } else {
-                    false
+                // The incoming data is stale so ignore.
+                let (existing_timestamp, existing_payload) = existing.get();
+                if *existing_timestamp >= timestamp {
+                    return false;
                 }
+
+                // The payload doesn't uniquify, so return.
+                if let None = payload {
+                    existing.insert((timestamp, payload));
+                    return true;
+                }
+
+                // The existing payload doesn't uniquify, so return.
+                if let None = existing_payload {
+                    existing.insert((timestamp, payload));
+                    return true;
+                }
+
+                // The payload has changed, so return.
+                if *payload.as_ref().unwrap() != *existing_payload.as_ref().unwrap() {
+                    existing.insert((timestamp, payload));
+                    return true;
+                }
+
+                // The payload hasn't changed, so ignore.
+                return false;
             }
         }
     }
@@ -156,6 +179,7 @@ impl<S: Eq + Hash, M: Eq + Hash + Clone> SubscriptionTracker<S, M> {
             subscription,
             &mut self.metadata_to_subscription,
             &mut self.subscription_to_metadata,
+            &mut self.last_payload_seen,
         )
     }
 
@@ -167,6 +191,7 @@ impl<S: Eq + Hash, M: Eq + Hash + Clone> SubscriptionTracker<S, M> {
         subscription: &ServerInstructionID,
         metadata_to_subscription: &mut HashMap<M, ServerInstructionID>,
         subscription_to_metadata: &mut HashMap<ServerInstructionID, M>,
+        last_payload_seen: &mut HashMap<ServerInstructionID, (u64, Option<String>)>,
     ) -> Option<bool> {
         if let Entry::Occupied(mut entry) = subscription_to_clients.entry(subscription.clone()) {
             let subscribed_clients = entry.get_mut();
@@ -184,6 +209,8 @@ impl<S: Eq + Hash, M: Eq + Hash + Clone> SubscriptionTracker<S, M> {
                     metadata_to_subscription,
                     subscription_to_metadata,
                 );
+
+                last_payload_seen.remove(&subscription);
 
                 // There aren't any subscribers remaining.
                 return Some(true);
@@ -219,6 +246,7 @@ impl<S: Eq + Hash, M: Eq + Hash + Clone> SubscriptionTracker<S, M> {
                     &subscription,
                     &mut self.metadata_to_subscription,
                     &mut self.subscription_to_metadata,
+                    &mut self.last_payload_seen,
                 ) {
                     if should_remove {
                         to_unsubscribe.push(subscription.clone());

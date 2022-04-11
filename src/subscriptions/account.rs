@@ -186,4 +186,19 @@ impl SubscriptionHandler<Subscription, Metadata> for AccountSubscriptionHandler 
     fn poll_method() -> &'static str {
         "accountNotification"
     }
+
+    /// Uniquify notifications by the returned data. The multiplexer will only
+    /// broadcast notifications when the data has changed.
+    fn notification_unique_key(notification: &jsonrpc::Notification) -> Option<String> {
+        if let serde_json::Value::Object(result) = &notification.params.result {
+            if let Some(serde_json::Value::Object(value)) = result.get("data") {
+                if let Some(serde_json::Value::Array(data)) = value.get("data") {
+                    if let Some(serde_json::Value::String(string)) = data.get(0) {
+                        return Some(string.clone());
+                    }
+                }
+            }
+        }
+        None
+    }
 }

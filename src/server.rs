@@ -1,12 +1,13 @@
 use crate::{
-    account_subscription::AccountSubscriptionHandler,
     channel_types::*,
     client::ClientHandler,
     endpoint::{self, EndpointConfig},
     jsonrpc,
-    logs_subscription::LogsSubscriptionHandler,
-    program_subscription::ProgramSubscriptionHandler,
-    subscription_handler::SubscriptionHandler,
+    subscriptions::{
+        AccountSubscriptionHandler, LogsSubscriptionHandler, ProgramSubscriptionHandler,
+        RootSubscriptionHandler, SignatureSubscriptionHandler, SlotSubscriptionHandler,
+        SubscriptionHandler,
+    },
 };
 use hyper::service::{make_service_fn, service_fn};
 use std::{collections::HashMap, sync::Arc};
@@ -30,6 +31,9 @@ pub struct Server {
     account_subscriptions: AccountSubscriptionHandler,
     logs_subscriptions: LogsSubscriptionHandler,
     program_subscriptions: ProgramSubscriptionHandler,
+    signature_subscriptions: SignatureSubscriptionHandler,
+    slot_subscriptions: SlotSubscriptionHandler,
+    root_subscriptions: RootSubscriptionHandler,
 }
 
 impl Server {
@@ -52,6 +56,9 @@ impl Server {
             account_subscriptions: AccountSubscriptionHandler::new(),
             logs_subscriptions: LogsSubscriptionHandler::new(),
             program_subscriptions: ProgramSubscriptionHandler::new(),
+            signature_subscriptions: SignatureSubscriptionHandler::new(),
+            slot_subscriptions: SlotSubscriptionHandler::new(),
+            root_subscriptions: RootSubscriptionHandler::new(),
         }
     }
 
@@ -177,6 +184,24 @@ impl Server {
                     self.send_to_pubsub.as_slice(),
                     self.send_to_http.as_slice(),
                 );
+                self.signature_subscriptions.unsubscribe_client(
+                    client.clone(),
+                    &mut self.next_instruction_id,
+                    self.send_to_pubsub.as_slice(),
+                    self.send_to_http.as_slice(),
+                );
+                self.slot_subscriptions.unsubscribe_client(
+                    client.clone(),
+                    &mut self.next_instruction_id,
+                    self.send_to_pubsub.as_slice(),
+                    self.send_to_http.as_slice(),
+                );
+                self.root_subscriptions.unsubscribe_client(
+                    client.clone(),
+                    &mut self.next_instruction_id,
+                    self.send_to_pubsub.as_slice(),
+                    self.send_to_http.as_slice(),
+                );
             }
 
             ClientToServer::PubSubRequest { client, request } => {
@@ -209,6 +234,18 @@ impl Server {
             }
             "programNotification" => {
                 self.program_subscriptions
+                    .broadcast(notification, &self.send_to_client);
+            }
+            "signatureNotification" => {
+                self.signature_subscriptions
+                    .broadcast_and_unsubscribe(notification, &self.send_to_client);
+            }
+            "slotNotification" => {
+                self.slot_subscriptions
+                    .broadcast(notification, &self.send_to_client);
+            }
+            "rootNotification" => {
+                self.root_subscriptions
                     .broadcast(notification, &self.send_to_client);
             }
             unknown => {
@@ -280,6 +317,66 @@ impl Server {
             }
             "programUnsubscribe" => {
                 self.program_subscriptions.unsubscribe(
+                    client,
+                    &request,
+                    &mut self.next_instruction_id,
+                    send_to_client.clone(),
+                    self.send_to_pubsub.as_slice(),
+                    self.send_to_http.as_slice(),
+                );
+            }
+            "signatureSubscribe" => {
+                self.signature_subscriptions.subscribe(
+                    client,
+                    &request,
+                    &mut self.next_instruction_id,
+                    send_to_client.clone(),
+                    self.send_to_pubsub.as_slice(),
+                    &self.send_to_http.as_slice(),
+                );
+            }
+            "signatureUnsubscribe" => {
+                self.signature_subscriptions.unsubscribe(
+                    client,
+                    &request,
+                    &mut self.next_instruction_id,
+                    send_to_client.clone(),
+                    self.send_to_pubsub.as_slice(),
+                    self.send_to_http.as_slice(),
+                );
+            }
+            "slotSubscribe" => {
+                self.slot_subscriptions.subscribe(
+                    client,
+                    &request,
+                    &mut self.next_instruction_id,
+                    send_to_client.clone(),
+                    self.send_to_pubsub.as_slice(),
+                    &self.send_to_http.as_slice(),
+                );
+            }
+            "slotUnsubscribe" => {
+                self.slot_subscriptions.unsubscribe(
+                    client,
+                    &request,
+                    &mut self.next_instruction_id,
+                    send_to_client.clone(),
+                    self.send_to_pubsub.as_slice(),
+                    self.send_to_http.as_slice(),
+                );
+            }
+            "rootSubscribe" => {
+                self.root_subscriptions.subscribe(
+                    client,
+                    &request,
+                    &mut self.next_instruction_id,
+                    send_to_client.clone(),
+                    self.send_to_pubsub.as_slice(),
+                    &self.send_to_http.as_slice(),
+                );
+            }
+            "rootUnsubscribe" => {
+                self.root_subscriptions.unsubscribe(
                     client,
                     &request,
                     &mut self.next_instruction_id,

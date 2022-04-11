@@ -1,4 +1,4 @@
-use crate::{channel_types::*, jsonrpc, subscription_tracker};
+use crate::{channel_types::*, jsonrpc, subscriptions::tracker::SubscriptionTracker};
 use std::{
     collections::{hash_map::Entry, HashMap},
     hash::Hash,
@@ -11,7 +11,7 @@ pub trait SubscriptionHandler<Subscription: Eq + Hash + Clone, Metadata: Eq + Ha
 
     fn tracker_mut(
         &mut self,
-    ) -> &mut subscription_tracker::SubscriptionTracker<Subscription, Metadata>;
+    ) -> &mut SubscriptionTracker<Subscription, Metadata>;
 
     fn unsubscribe_method() -> &'static str;
     fn poll_method() -> &'static str;
@@ -245,6 +245,25 @@ pub trait SubscriptionHandler<Subscription: Eq + Hash + Clone, Metadata: Eq + Ha
                         }
                     }
                 }
+            }
+        }
+    }
+
+    fn broadcast_and_unsubscribe(
+        &mut self,
+        notification: jsonrpc::Notification,
+        send_to_client: &HashMap<ClientID, UnboundedSender<ServerToClient>>,
+    ) {
+        let id = ServerInstructionID(notification.params.subscription);
+        self.broadcast(notification, send_to_client);
+
+        if let Some(subscriptions) = self.tracker_mut().get_notification_subscribers(&id) {
+            let mut clients = Vec::new();
+            for subscription in subscriptions.iter() {
+                clients.push(subscription.client.clone());
+            }
+            for client in clients.iter() {
+                self.tracker_mut().remove_client(client);
             }
         }
     }

@@ -1,4 +1,8 @@
-use crate::{channel_types::*, jsonrpc, subscription_handler, subscription_tracker};
+use crate::{
+    channel_types::*,
+    jsonrpc,
+    subscriptions::{handler::SubscriptionHandler, tracker::SubscriptionTracker},
+};
 use std::str::FromStr;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -13,25 +17,23 @@ pub struct Metadata {
 }
 
 pub struct LogsSubscriptionHandler {
-    tracker: subscription_tracker::SubscriptionTracker<Subscription, Metadata>,
+    tracker: SubscriptionTracker<Subscription, Metadata>,
 }
 
 impl LogsSubscriptionHandler {
     pub fn new() -> Self {
         Self {
-            tracker: subscription_tracker::SubscriptionTracker::new(),
+            tracker: SubscriptionTracker::new(),
         }
     }
 }
 
 pub struct FormatState {}
 
-impl subscription_handler::SubscriptionHandler<Subscription, Metadata> for LogsSubscriptionHandler {
+impl SubscriptionHandler<Subscription, Metadata> for LogsSubscriptionHandler {
     type FormatState = FormatState;
 
-    fn tracker_mut(
-        &mut self,
-    ) -> &mut subscription_tracker::SubscriptionTracker<Subscription, Metadata> {
+    fn tracker_mut(&mut self) -> &mut SubscriptionTracker<Subscription, Metadata> {
         &mut self.tracker
     }
 

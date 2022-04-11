@@ -57,6 +57,60 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         {
             "jsonrpc": "2.0",
             "id": 1,
+            "method": "accountSubscribe",
+            "params": ["vgcDar2pryHvMgPkKaZfh8pQy4BJxv7SpwUG7zinWjG"]
+        }
+        "#
+        .to_string(),
+    ))
+    .await?;
+
+    ws.send(Message::Text(
+        r#"
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "logsSubscribe",
+            "params": ["all"]
+        }
+        "#
+        .to_string(),
+    ))
+    .await?;
+
+    ws.send(Message::Text(
+        r#"
+        {
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "programSubscribe",
+            "params": ["11111111111111111111111111111111"]
+        }
+        "#
+        .to_string(),
+    ))
+    .await?;
+
+    ws.send(Message::Text(
+        r#"
+        {
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "signatureSubscribe",
+            "params": [
+              "2EBVM6cB8vAAD93Ktr6Vd8p67XPbQzCJX47MpReuiCXJAtcjaxpvWpcg9Ege1Nr5Tk3a2GFrByT7WPBjdsTycY9b"
+            ]
+          }
+        "#
+        .to_string(),
+    ))
+    .await?;
+
+    ws.send(Message::Text(
+        r#"
+        {
+            "jsonrpc": "2.0",
+            "id": 5,
             "method": "slotSubscribe"
         }
         "#
@@ -68,13 +122,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         r#"
         {
             "jsonrpc": "2.0",
-            "id": 1,
+            "id": 6,
             "method": "rootSubscribe"
         }
         "#
         .to_string(),
     ))
     .await?;
+
+
 
     while let Some(message) = ws.next().await {
         info!("pubsub message: {:?}", message);

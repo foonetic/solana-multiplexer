@@ -9,7 +9,7 @@ use std::str::FromStr;
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Subscription {}
 
-/// Clients may pass "all"|"allWithVotes"|{"mention":"<>"}|{"commitment":<>}
+/// Clients may pass "all"|"allWithVotes"|{"mentions":["<>"]}|{"commitment":<>}
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Metadata {
     is_all: bool,

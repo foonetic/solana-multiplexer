@@ -37,6 +37,7 @@ pub struct PubsubEndpoint {
     receive_from_server: UnboundedReceiver<ServerToPubsub>,
     global_to_local_subscriber: HashMap<ServerInstructionID, EndpointSubscriberID>,
     local_to_global_subscriber: HashMap<EndpointSubscriberID, ServerInstructionID>,
+    global_to_type: HashMap<ServerInstructionID, SubscriptionType>,
 }
 
 impl PubsubEndpoint {
@@ -64,6 +65,7 @@ impl PubsubEndpoint {
             receive_from_server,
             global_to_local_subscriber: HashMap::new(),
             local_to_global_subscriber: HashMap::new(),
+            global_to_type: HashMap::new(),
         }
     }
 
@@ -127,29 +129,25 @@ impl PubsubEndpoint {
     }
 
     fn on_json(&mut self, value: serde_json::Value) {
-        // Check for subscription and method. These fields indicate the type of
-        // response that should be sent back.
-        if let Ok(notification) =
-            serde_json::from_value::<jsonrpc::AccountNotification>(value.clone())
+        if let Ok(mut notification) = serde_json::from_value::<jsonrpc::Notification>(value.clone())
         {
-            self.on_account_notification(notification)
+            if let Some(id) = self
+                .local_to_global_subscriber
+                .get(&EndpointSubscriberID(notification.params.subscription))
+            {
+                notification.params.subscription = id.0;
+                if let Err(err) = self
+                    .send_to_server
+                    .send(EndpointToServer::Notification(notification))
+                {
+                    error!(
+                        "unable to enqueue notification from pubsub endpoint: {}",
+                        err
+                    );
+                }
+            }
         } else if let Ok(reply) = serde_json::from_value::<jsonrpc::SubscribeResponse>(value) {
             self.on_subscribe_reply(reply);
-        }
-    }
-
-    fn on_account_notification(&mut self, mut reply: jsonrpc::AccountNotification) {
-        if let Some(id) = self
-            .local_to_global_subscriber
-            .get(&EndpointSubscriberID(reply.params.subscription))
-        {
-            reply.params.subscription = id.0;
-            if let Err(err) = self
-                .send_to_server
-                .send(EndpointToServer::AccountNotification(reply))
-            {
-                error!(unable_to_enqueue_account_notification = err.to_string().as_str());
-            }
         }
     }
 
@@ -166,9 +164,10 @@ impl PubsubEndpoint {
 
     fn on_instruction(&mut self, message: ServerToPubsub) {
         match message {
-            ServerToPubsub::AccountSubscribe {
+            ServerToPubsub::Subscribe {
                 subscription,
                 request,
+                subscription_type,
             } => {
                 info!(
                     "pubsub endpoint subscribing to global id {}",
@@ -177,29 +176,33 @@ impl PubsubEndpoint {
                 if let Err(err) = self.enqueue.send(Message::Text(request)) {
                     error!("failed to enqueue pubsub write: {}", err);
                 }
+                self.global_to_type.insert(subscription, subscription_type);
             }
 
-            ServerToPubsub::AccountUnsubscribe {
+            ServerToPubsub::Unsubscribe {
                 request_id,
                 subscription,
             } => {
                 let entry = self.global_to_local_subscriber.entry(subscription.clone());
+                let subscription_type = self.global_to_type.remove(&subscription);
                 match entry {
                     Entry::Occupied(got) => {
                         info!(
                             "pubsub endpoint unsubscribing to global id {}",
                             subscription.0,
                         );
-                        let instruction = format!(
-                            r#"{{"jsonrpc":"2.0","id":{},"method":"accountUnsubscribe","params":[{}]}}"#,
-                            request_id.0,
-                            got.get().0,
-                        );
-                        if let Err(err) = self.enqueue.send(Message::Text(instruction)) {
-                            error!("failed to enqueue pubsub write: {}", err);
+                        if let Some(subscription_type) = subscription_type {
+                            let instruction = format!(
+                                r#"{{"jsonrpc":"2.0","id":{},"method":"{}","params":[{}]}}"#,
+                                request_id.0,
+                                subscription_type.to_unsubscribe_method(),
+                                got.get().0,
+                            );
+                            if let Err(err) = self.enqueue.send(Message::Text(instruction)) {
+                                error!("failed to enqueue pubsub write: {}", err);
+                            }
                         }
-                        self.local_to_global_subscriber.remove(got.get());
-                        got.remove();
+                        self.local_to_global_subscriber.remove(&got.remove());
                     }
                     Entry::Vacant(_) => {}
                 }
@@ -268,20 +271,18 @@ impl HTTPPoll {
                     // endpoint. Reformat everything to look like the
                     // websocket format. Downstream clients will only
                     // subscribe to the websocket.
-                    let notification = jsonrpc::AccountNotification {
+                    let notification = jsonrpc::Notification {
                         jsonrpc: account_info.jsonrpc,
                         method: "accountNotification".to_string(),
-                        params: jsonrpc::AccountNotificationParams {
-                            result: account_info.result,
+                        params: jsonrpc::NotificationParams {
+                            result: serde_json::to_value(account_info.result)
+                                .expect("unable to convert to JSON value"),
                             subscription: account_info.id,
                         },
                     };
                     // Let the query fail since we will retry momentarily.
                     // TODO: Limit retries, throttle.
-                    if let Err(err) = self
-                        .send
-                        .send(EndpointToServer::AccountNotification(notification))
-                    {
+                    if let Err(err) = self.send.send(EndpointToServer::Notification(notification)) {
                         error!(
                             "http endpoint {} failed to poll: {}",
                             self.url.as_str(),
@@ -337,10 +338,15 @@ impl HTTPEndpoint {
 
     fn on_message(&mut self, message: ServerToHTTP) {
         match message {
-            ServerToHTTP::AccountSubscribe {
+            ServerToHTTP::Subscribe {
                 subscription,
                 request,
+                subscription_type,
             } => {
+                if !matches!(subscription_type, SubscriptionType::Account) {
+                    return;
+                }
+
                 info!(
                     "http endpoint {} subscribing to global id {}",
                     self.url.as_str(),
@@ -362,7 +368,7 @@ impl HTTPEndpoint {
                 });
             }
 
-            ServerToHTTP::AccountUnsubscribe(subscription) => {
+            ServerToHTTP::Unsubscribe(subscription) => {
                 info!(
                     "http endpoint {} unsubscribing to global id {}",
                     self.url.as_str(),

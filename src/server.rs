@@ -1,16 +1,13 @@
 use crate::{
-    account_subscription::{self, AccountSubscription, AccountSubscriptionMetadata},
+    account_subscription::AccountSubscriptionHandler,
     channel_types::*,
     client::ClientHandler,
     endpoint::{self, EndpointConfig},
     jsonrpc,
-    subscription_tracker::SubscriptionTracker,
+    subscription_handler::SubscriptionHandler,
 };
 use hyper::service::{make_service_fn, service_fn};
-use std::{
-    collections::{hash_map::Entry, HashMap},
-    sync::Arc,
-};
+use std::{collections::HashMap, sync::Arc};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tracing::{error, info};
 
@@ -28,8 +25,7 @@ pub struct Server {
     send_to_pubsub: Vec<UnboundedSender<ServerToPubsub>>,
     send_to_client: HashMap<ClientID, UnboundedSender<ServerToClient>>,
 
-    account_subscription_tracker:
-        SubscriptionTracker<AccountSubscription, AccountSubscriptionMetadata>,
+    account_subscriptions: AccountSubscriptionHandler,
 }
 
 impl Server {
@@ -49,7 +45,7 @@ impl Server {
             send_to_http: Vec::new(),
             send_to_pubsub: Vec::new(),
             send_to_client: HashMap::new(),
-            account_subscription_tracker: SubscriptionTracker::new(),
+            account_subscriptions: AccountSubscriptionHandler::new(),
         }
     }
 
@@ -157,7 +153,12 @@ impl Server {
             }
 
             ClientToServer::RemoveClient(client) => {
-                self.process_remove_client(client);
+                self.account_subscriptions.unsubscribe_client(
+                    client.clone(),
+                    &mut self.next_instruction_id,
+                    self.send_to_pubsub.as_slice(),
+                    self.send_to_http.as_slice(),
+                );
             }
 
             ClientToServer::PubSubRequest { client, request } => {
@@ -172,91 +173,16 @@ impl Server {
 
     fn on_endpoint_message(&mut self, message: EndpointToServer) {
         match message {
-            EndpointToServer::AccountNotification(notification) => {
-                self.process_account_notification(notification);
+            EndpointToServer::Notification(notification) => {
+                self.process_notification(notification);
             }
         }
     }
 
-    fn process_account_notification(&mut self, notification: jsonrpc::AccountNotification) {
-        if self
-            .account_subscription_tracker
-            .notification_is_most_recent(&notification)
-        {
-            self.broadcast_account_notification(&notification);
-        }
-    }
-
-    fn broadcast_account_notification(&mut self, notification: &jsonrpc::AccountNotification) {
-        if let Some(subscribers) = self
-            .account_subscription_tracker
-            .get_notification_subscribers(notification)
-        {
-            let mut cache: HashMap<Encoding, String> = HashMap::new();
-            for subscriber in subscribers.iter() {
-                let mut raw_bytes = None;
-
-                if let Some(sender) = self.send_to_client.get(&subscriber.client) {
-                    if let Some(subscription) = &subscriber.subscription {
-                        match cache.entry(subscription.encoding.clone()) {
-                            Entry::Occupied(element) => {
-                                Self::send_string(sender.clone(), element.get().clone());
-                            }
-                            Entry::Vacant(element) => {
-                                match account_subscription::format_notification(
-                                    &mut raw_bytes,
-                                    notification,
-                                    subscription,
-                                ) {
-                                    Some(value) => {
-                                        Self::send_string(sender.clone(), value.clone());
-                                        element.insert(value);
-                                    }
-                                    None => {
-                                        error!(
-                                            "notification could not be formatted: {:?}",
-                                            notification
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    fn process_remove_client(&mut self, client: ClientID) {
-        self.send_to_client.remove(&client);
-        info!("removing client {}", client.0);
-
-        let mut to_unsubscribe = self.account_subscription_tracker.remove_client(&client);
-        for unsubscribe in to_unsubscribe.drain(0..) {
-            self.remove_global_subscription(&unsubscribe);
-        }
-    }
-
-    /// Unsubscribes from a global subscription ID. This does *NOT* check that
-    /// all clients have been removed! Caller is responsible for ensuring that
-    /// the subscription is indeed no longer needed.
-    fn remove_global_subscription(&mut self, unsubscribe: &ServerInstructionID) {
-        let instruction_id = self.next_instruction_id.clone();
-        self.next_instruction_id.0 += 1;
-
-        for endpoint in self.send_to_http.iter() {
-            if let Err(err) = endpoint.send(ServerToHTTP::AccountUnsubscribe(unsubscribe.clone())) {
-                error!("server to http channel failure: {}", err);
-            }
-        }
-
-        for endpoint in self.send_to_pubsub.iter() {
-            if let Err(err) = endpoint.send(ServerToPubsub::AccountUnsubscribe {
-                request_id: instruction_id.clone(),
-                subscription: unsubscribe.clone(),
-            }) {
-                error!("server to pubsub channel failure: {}", err);
-            }
+    fn process_notification(&mut self, notification: jsonrpc::Notification) {
+        if notification.method.as_str() == AccountSubscriptionHandler::notification_method() {
+            self.account_subscriptions
+                .broadcast(notification, &self.send_to_client);
         }
     }
 
@@ -269,10 +195,24 @@ impl Server {
 
         match request.method.as_str() {
             "accountSubscribe" => {
-                self.process_account_subscribe(send_to_client.clone(), client, request);
+                self.account_subscriptions.subscribe(
+                    client,
+                    &request,
+                    &mut self.next_instruction_id,
+                    send_to_client.clone(),
+                    self.send_to_pubsub.as_slice(),
+                    &self.send_to_http.as_slice(),
+                );
             }
             "accountUnsubscribe" => {
-                self.process_account_unsubscribe(send_to_client.clone(), client, request);
+                self.account_subscriptions.unsubscribe(
+                    client,
+                    &request,
+                    &mut self.next_instruction_id,
+                    send_to_client.clone(),
+                    self.send_to_pubsub.as_slice(),
+                    self.send_to_http.as_slice(),
+                );
             }
             unknown => {
                 Self::send_error(
@@ -333,146 +273,10 @@ impl Server {
         info!("client {} disconnected", client.0);
     }
 
-    fn process_account_unsubscribe(
-        &mut self,
-        send_to_client: UnboundedSender<ServerToClient>,
-        client: ClientID,
-        request: jsonrpc::Request,
-    ) {
-        let mut to_unsubscribe = None;
-        if let serde_json::Value::Array(params) = request.params {
-            if params.len() == 1 {
-                if let Some(serde_json::Value::Number(num)) = params.get(0) {
-                    to_unsubscribe = num.as_i64();
-                }
-            }
-        }
-
-        if to_unsubscribe.is_none() {
-            Self::send_error(
-                send_to_client.clone(),
-                jsonrpc::ErrorCode::InvalidParams,
-                "unable to parse unsubscribe parameters".to_string(),
-                request.id,
-            );
-            return;
-        }
-        let to_unsubscribe = ServerInstructionID(to_unsubscribe.unwrap());
-
-        if let Some(should_remove_globally) = self
-            .account_subscription_tracker
-            .remove_single_subscription(&client, &to_unsubscribe)
-        {
-            info!(
-                "pubsub client {} unsubscribing to {}",
-                client.0, to_unsubscribe.0
-            );
-            Self::send_unsubscribe_response(send_to_client.clone(), request.id);
-            if should_remove_globally {
-                self.remove_global_subscription(&to_unsubscribe);
-            }
-        } else {
-            Self::send_error(
-                send_to_client.clone(),
-                jsonrpc::ErrorCode::InvalidRequest,
-                "not currently subscribed".to_string(),
-                request.id,
-            );
-            return;
-        }
-    }
-
-    fn process_account_subscribe(
-        &mut self,
-        send_to_client: UnboundedSender<ServerToClient>,
-        client: ClientID,
-        request: jsonrpc::Request,
-    ) {
-        let result = account_subscription::parse_subscribe(&request);
-        match result {
-            Ok((metadata, subscription)) => {
-                let (subscription_id, is_new) =
-                    self.account_subscription_tracker.track_subscription(
-                        &client,
-                        &mut self.next_instruction_id,
-                        Some(subscription),
-                        metadata.clone(),
-                    );
-
-                if is_new {
-                    info!(
-                        "pubsub client {} subscribing to {} as global id {}",
-                        client.0, &metadata.pubkey, subscription_id.0
-                    );
-                    if self.send_to_pubsub.len() > 0 {
-                        let request = account_subscription::format_pubsub_subscription(
-                            &subscription_id,
-                            &metadata,
-                        );
-                        for endpoint in self.send_to_pubsub.iter() {
-                            endpoint
-                                .send(ServerToPubsub::AccountSubscribe {
-                                    subscription: subscription_id.clone(),
-                                    request: request.clone(),
-                                })
-                                .expect("pubsub endpoint channel died");
-                        }
-                    }
-                    if self.send_to_http.len() > 0 {
-                        let request =
-                            account_subscription::format_http_poll(&subscription_id, &metadata);
-                        for endpoint in self.send_to_http.iter() {
-                            endpoint
-                                .send(ServerToHTTP::AccountSubscribe {
-                                    subscription: subscription_id.clone(),
-                                    request: request.clone(),
-                                })
-                                .expect("http endpoint channel died");
-                        }
-                    }
-                }
-
-                Self::send_subscription_response(send_to_client, request.id, subscription_id.0);
-            }
-            Err(err) => {
-                Self::send_error(
-                    send_to_client,
-                    jsonrpc::ErrorCode::InvalidParams,
-                    err.to_string(),
-                    request.id,
-                );
-            }
-        }
-    }
-
     fn send_string(send_to_client: UnboundedSender<ServerToClient>, message: String) {
         if let Err(err) = send_to_client.send(ServerToClient::Message(message)) {
             error!("server to client channel failure: {}", err);
         }
-    }
-
-    fn send_subscription_response(
-        send_to_client: UnboundedSender<ServerToClient>,
-        id: i64,
-        result: i64,
-    ) {
-        let json = serde_json::to_string(&jsonrpc::SubscribeResponse {
-            jsonrpc: "2.0".to_string(),
-            result,
-            id,
-        })
-        .expect("unable to serialize subscription reply to json");
-        Self::send_string(send_to_client, json);
-    }
-
-    fn send_unsubscribe_response(send_to_client: UnboundedSender<ServerToClient>, id: i64) {
-        let json = serde_json::to_string(&jsonrpc::UnsubscribeResponse {
-            jsonrpc: "2.0".to_string(),
-            result: true,
-            id,
-        })
-        .expect("unable to serialize unsubscribe reply to json");
-        Self::send_string(send_to_client, json);
     }
 
     fn send_error(

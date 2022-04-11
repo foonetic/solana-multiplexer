@@ -1,4 +1,4 @@
-use crate::{channel_types::*, jsonrpc};
+use crate::channel_types::*;
 use std::{
     collections::{hash_map::Entry, HashMap, HashSet},
     hash::{Hash, Hasher},
@@ -114,19 +114,18 @@ impl<S: Eq + Hash, M: Eq + Hash + Clone> SubscriptionTracker<S, M> {
     /// if the subscription is new or has a later slot than any existing notification.
     pub fn notification_is_most_recent(
         &mut self,
-        notification: &jsonrpc::AccountNotification,
+        subscription: &ServerInstructionID,
+        timestamp: u64,
     ) -> bool {
-        let latest = self
-            .account_notifications
-            .entry(ServerInstructionID(notification.params.subscription));
+        let latest = self.account_notifications.entry(subscription.clone());
         match latest {
             Entry::Vacant(entry) => {
-                entry.insert(notification.params.result.context.slot);
+                entry.insert(timestamp);
                 true
             }
             Entry::Occupied(mut existing) => {
-                if *existing.get() < notification.params.result.context.slot {
-                    existing.insert(notification.params.result.context.slot);
+                if *existing.get() < timestamp {
+                    existing.insert(timestamp);
                     true
                 } else {
                     false
@@ -137,10 +136,9 @@ impl<S: Eq + Hash, M: Eq + Hash + Clone> SubscriptionTracker<S, M> {
 
     pub fn get_notification_subscribers(
         &self,
-        notification: &jsonrpc::AccountNotification,
+        subscription: &ServerInstructionID,
     ) -> Option<&HashSet<Subscription<S>>> {
-        self.subscription_to_clients
-            .get(&ServerInstructionID(notification.params.subscription))
+        self.subscription_to_clients.get(subscription)
     }
 
     /// Removes a single subscription for a client. Returns true if that

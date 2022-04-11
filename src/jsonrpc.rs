@@ -31,20 +31,19 @@ pub struct Request {
 pub struct Notification {
     pub jsonrpc: String,
     pub method: String,
-    pub params: serde_json::Value,
+    pub params: NotificationParams,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct AccountNotification {
-    pub jsonrpc: String,
-    pub method: String,
-    pub params: AccountNotificationParams,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct AccountNotificationParams {
-    pub result: AccountNotificationResult,
+pub struct NotificationParams {
+    pub result: serde_json::Value,
     pub subscription: i64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct NotificationResultWithContext {
+    pub context: ContextWithSlot,
+    pub value: serde_json::Value,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

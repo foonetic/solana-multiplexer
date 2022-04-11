@@ -11,6 +11,7 @@ use tracing::{error, info};
 type Response = hyper::Response<Body>;
 type Error = Box<dyn std::error::Error + Send + Sync + 'static>;
 
+/// Handles client-server communication.
 pub struct ClientHandler {
     send_to_server: UnboundedSender<ClientToServer>,
 }
@@ -20,6 +21,7 @@ impl ClientHandler {
         ClientHandler { send_to_server }
     }
 
+    /// Initializes a websocket connection at the client's request.
     fn on_upgrade(
         &mut self,
         request: Request<Body>,
@@ -39,6 +41,7 @@ impl ClientHandler {
         Ok(response)
     }
 
+    /// Responds to an HTTP request.
     async fn on_http(
         &mut self,
         request: Request<Body>,
@@ -114,6 +117,7 @@ impl ClientHandler {
         }
     }
 
+    /// Creates an error response for the client.
     fn error_response(code: jsonrpc::ErrorCode, message: String, id: i64) -> Response {
         let obj = jsonrpc::Error {
             jsonrpc: "2.0".to_string(),
@@ -125,6 +129,7 @@ impl ClientHandler {
         Response::new(Body::from(json))
     }
 
+    /// Handles an incoming response from the client.
     pub async fn run(&mut self, request: Request<Body>) -> Result<Response, Error> {
         let (send_to_client, mut receive_from_server) = unbounded_channel();
         if let Err(err) = self
@@ -165,6 +170,7 @@ impl ClientHandler {
     }
 }
 
+/// Manages a pubsub-client relationship.
 struct PubSubClient {
     client_id: ClientID,
     websocket: Option<HyperWebsocket>,
@@ -189,6 +195,7 @@ impl PubSubClient {
         }
     }
 
+    /// Main event loop for reading and writing a pubsub connection.
     async fn run(&mut self) {
         let (enqueue_client, mut dequeue_client) = unbounded_channel();
         self.enqueue_client = Some(enqueue_client);
@@ -223,6 +230,7 @@ impl PubSubClient {
         }
     }
 
+    /// Handle one event in the main event loop.
     async fn poll(
         &mut self,
         read: &mut SplitStream<WebSocketStream<Upgraded>>,
@@ -242,6 +250,7 @@ impl PubSubClient {
         }
     }
 
+    /// Handles a message from the client.
     fn on_client_message(&mut self, message: Message) -> Result<(), Box<dyn std::error::Error>> {
         match message {
             Message::Text(msg) => self.on_text_message(msg),
@@ -264,6 +273,7 @@ impl PubSubClient {
         }
     }
 
+    /// Handles a message from the server.
     fn on_server_message(
         &mut self,
         message: ServerToClient,
@@ -282,6 +292,7 @@ impl PubSubClient {
         }
     }
 
+    /// Handles a message from the client that was determined to be text.
     fn on_text_message(&mut self, msg: String) -> Result<(), Box<dyn std::error::Error>> {
         let result = serde_json::from_str::<jsonrpc::Request>(&msg);
         match result {
@@ -300,6 +311,7 @@ impl PubSubClient {
         }
     }
 
+    /// Handles a message from the client that was determined to be binary.
     fn on_binary_message(&mut self, msg: Vec<u8>) -> Result<(), Box<dyn std::error::Error>> {
         let result = serde_json::from_slice::<jsonrpc::Request>(&msg);
         match result {
@@ -318,6 +330,7 @@ impl PubSubClient {
         }
     }
 
+    /// Sends an error to the client.
     fn send_error(
         &mut self,
         id: i64,
@@ -338,6 +351,7 @@ impl PubSubClient {
             .map_err(|e| e.into())
     }
 
+    /// Sends a disconnect message to the client.
     fn disconnect(&mut self) {
         info!("disconnecting client {}", self.client_id.0);
         if let Err(err) = self
@@ -348,6 +362,8 @@ impl PubSubClient {
         }
     }
 
+    /// Sends a disconnect message to the client and returns an error to stop
+    /// the event loop.
     fn on_disconnect(&mut self, msg: Option<CloseFrame>) -> Result<(), Box<dyn std::error::Error>> {
         self.disconnect();
         Err(Box::new(std::io::Error::new(

@@ -14,8 +14,8 @@ use std::{collections::HashMap, sync::Arc};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tracing::{error, info};
 
-/// Implements a subset of a Solana PubSub endpoint that multiplexes across
-/// various endpoints.
+/// Implements a subset of a Solana PubSub endpoint supporting HTTP and PubSub
+/// API calls.
 pub struct Server {
     next_client_id: ClientID,
     next_instruction_id: ServerInstructionID,
@@ -37,8 +37,6 @@ pub struct Server {
 }
 
 impl Server {
-    /// Initializes the server to connect to the given endpoints. The server
-    /// will listen at the input address.
     pub fn new() -> Self {
         let (client_to_server, receive_from_client) = unbounded_channel();
         let (endpoint_to_server, receive_from_endpoint) = unbounded_channel();
@@ -62,7 +60,8 @@ impl Server {
         }
     }
 
-    /// Server event loop that continuously polls for new clients.
+    /// Runs the main event loop. Connects to the listed endpoints and serves
+    /// the API at the given address.
     pub async fn run(
         &mut self,
         config: &[EndpointConfig],
@@ -76,6 +75,7 @@ impl Server {
         }
     }
 
+    /// Processes one event in the main event loop.
     async fn poll(&mut self) {
         tokio::select! {
             Some(from_client) = self.receive_from_client.recv() => {
@@ -87,6 +87,7 @@ impl Server {
         }
     }
 
+    /// Starts listening at the given address for clients.
     async fn spawn_listener(&self, address: &str) -> Result<(), Box<dyn std::error::Error>> {
         let address: std::net::SocketAddr = address.parse()?;
         let send_to_server = self.client_to_server.clone();
@@ -115,6 +116,7 @@ impl Server {
         Ok(())
     }
 
+    /// Initializes connections to all configured endpoints.
     async fn spawn_endpoints(&mut self, config: &[EndpointConfig]) {
         let client = Arc::new(reqwest::Client::new());
         for endpoint in config.iter() {
@@ -153,6 +155,7 @@ impl Server {
         }
     }
 
+    /// Processes a client message.
     fn on_client_message(&mut self, message: ClientToServer) {
         match message {
             ClientToServer::Initialize(sender) => {
@@ -214,6 +217,7 @@ impl Server {
         }
     }
 
+    /// Processes an endpoint message.
     fn on_endpoint_message(&mut self, message: EndpointToServer) {
         match message {
             EndpointToServer::Notification(notification) => {
@@ -222,6 +226,7 @@ impl Server {
         }
     }
 
+    /// Processes an endpoint message that was determined to be a notification.
     fn process_notification(&mut self, notification: jsonrpc::Notification) {
         match notification.method.as_str() {
             "accountNotification" => {
@@ -257,6 +262,7 @@ impl Server {
         }
     }
 
+    /// Processes a client pubsub request.
     fn process_pubsub(&mut self, client: ClientID, request: jsonrpc::Request) {
         let send_to_client = self.send_to_client.get(&client);
         if send_to_client.is_none() {
@@ -396,6 +402,7 @@ impl Server {
         }
     }
 
+    /// Processes a client HTTP request.
     fn process_http(&mut self, client: ClientID, request: jsonrpc::Request) {
         // The client may have already disconnected. In that case, skip the request.
         if let Some(send_to_client) = self.send_to_client.get(&client) {
@@ -444,12 +451,14 @@ impl Server {
         info!("client {} disconnected", client.0);
     }
 
+    /// Sends a string message to the client.
     fn send_string(send_to_client: UnboundedSender<ServerToClient>, message: String) {
         if let Err(err) = send_to_client.send(ServerToClient::Message(message)) {
             error!("server to client channel failure: {}", err);
         }
     }
 
+    /// Sends an error message to the client.
     fn send_error(
         send_to_client: UnboundedSender<ServerToClient>,
         code: jsonrpc::ErrorCode,

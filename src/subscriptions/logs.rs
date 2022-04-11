@@ -5,9 +5,11 @@ use crate::{
 };
 use std::str::FromStr;
 
+/// Clients may not configure anything about the response.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Subscription {}
 
+/// Clients may pass "all"|"allWithVotes"|{"mention":"<>"}|{"commitment":<>}
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Metadata {
     is_all: bool,
@@ -16,6 +18,7 @@ pub struct Metadata {
     commitment: Commitment,
 }
 
+/// Handles log subscriptions.
 pub struct LogsSubscriptionHandler {
     tracker: SubscriptionTracker<Subscription, Metadata>,
 }
@@ -28,6 +31,7 @@ impl LogsSubscriptionHandler {
     }
 }
 
+/// No state is required for formatting.
 pub struct FormatState {}
 
 impl SubscriptionHandler<Subscription, Metadata> for LogsSubscriptionHandler {
@@ -137,11 +141,5 @@ impl SubscriptionHandler<Subscription, Metadata> for LogsSubscriptionHandler {
 
     fn poll_method() -> &'static str {
         ""
-    }
-
-    fn transform_http_to_pubsub(
-        result: jsonrpc::Notification,
-    ) -> Result<jsonrpc::Notification, String> {
-        Ok(result)
     }
 }

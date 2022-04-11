@@ -27,9 +27,14 @@ pub enum EndpointConfig {
     PubSub(Url),
 }
 
+/// Represents a local subscriber ID. This is very likely to be a different
+/// number from the server-provided instruction ID. The endpoint is responsible
+/// for mapping the subscriber back to the global ID in all notification sent to
+/// the server.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct EndpointSubscriberID(i64);
 
+/// Represents a PubSub endpont.
 pub struct PubsubEndpoint {
     reader: SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>,
     enqueue: UnboundedSender<Message>,
@@ -67,6 +72,7 @@ impl PubsubEndpoint {
         }
     }
 
+    /// Event loop for the PubSub endpoint.
     pub async fn run(&mut self) {
         let mut interval = time::interval(Duration::from_secs(30));
         loop {
@@ -95,6 +101,7 @@ impl PubsubEndpoint {
         }
     }
 
+    /// Handles a websocket event.
     fn on_message(&mut self, message: Message) {
         match message {
             Message::Text(msg) => self.on_text_message(msg),
@@ -114,18 +121,21 @@ impl PubsubEndpoint {
         }
     }
 
+    /// Handles a text websocket event.
     fn on_text_message(&mut self, message: String) {
         if let Ok(reply) = serde_json::from_str(&message) {
             self.on_json(reply);
         }
     }
 
+    /// Handles a binary websocket event.
     fn on_binary_message(&mut self, message: Vec<u8>) {
         if let Ok(reply) = serde_json::from_slice(&message) {
             self.on_json(reply);
         }
     }
 
+    /// Handles a json websocket event.
     fn on_json(&mut self, value: serde_json::Value) {
         if let Ok(mut notification) = serde_json::from_value::<jsonrpc::Notification>(value.clone())
         {
@@ -157,6 +167,8 @@ impl PubsubEndpoint {
         }
     }
 
+    /// Handles a subscriptiohn reply. Maps the subscription ID to the global
+    /// unique ID that was used in the subscription request.
     fn on_subscribe_reply(&mut self, reply: jsonrpc::SubscribeResponse) {
         self.global_to_local_subscriber.insert(
             ServerInstructionID(reply.id),
@@ -168,6 +180,7 @@ impl PubsubEndpoint {
         );
     }
 
+    /// Handles an instruction from the server.
     fn on_instruction(&mut self, message: ServerToPubsub) {
         match message {
             ServerToPubsub::Subscribe {
@@ -245,6 +258,7 @@ impl HTTPPoll {
         }
     }
 
+    /// Repeatedly sends HTTP requests until the subscription is removed.
     async fn run(&mut self) {
         let mut interval = time::interval(self.frequency);
         loop {
@@ -260,6 +274,7 @@ impl HTTPPoll {
         }
     }
 
+    /// Sends a single HTTP request.
     async fn query(&mut self) {
         if let Ok(result) = self
             .client
@@ -294,6 +309,8 @@ impl HTTPPoll {
     }
 }
 
+/// Represents an HTTP endpoint that can either be polled or used to send single
+/// requests.
 pub struct HTTPEndpoint {
     client: Arc<reqwest::Client>,
     url: Url,
@@ -321,12 +338,14 @@ impl HTTPEndpoint {
         }
     }
 
+    /// Main event loop.
     pub async fn run(&mut self) {
         loop {
             self.poll().await;
         }
     }
 
+    /// Process one event in the event loop.
     async fn poll(&mut self) {
         tokio::select! {
             Some(message) = self.receive_from_server.recv() => {
@@ -335,6 +354,8 @@ impl HTTPEndpoint {
         }
     }
 
+    /// Processes a message from the server. Handles subscribe, unsubscribe, and
+    /// direct HTTP requests.
     fn on_message(&mut self, message: ServerToHTTP) {
         match message {
             ServerToHTTP::Subscribe {

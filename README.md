@@ -12,9 +12,12 @@ round-robin to a single HTTP endpoint.
 
 The following subset of PubSub subscriptions is supported:
 
-    - accountSubscribe
-    - logsSubscribe
-    - programSubscribe
+- accountSubscribe
+- logsSubscribe
+- programSubscribe
+- signatureSubscribe
+- slotSubscribe
+- rootSubscribe
 
 In addition, as a special case, HTTP endpoints will poll accounts subscribe via
 accountSubscribe at a specified frequency until the subscription is cancelled.
@@ -29,7 +32,7 @@ multiplexer subscriber may subscribe to a different set of accounts.
 Subscription requests shared by multiple subscribers will be dispatched once by
 the multiplexer and forwarded to each subscribed client.
 
-## Example
+## Example Invocation
 The following invocation arbitrates among two websocket endpoints and two http
 endpoints. The arbitrated websocket endpoint is served at `0.0.0.0:8900`. HTTP
 endpoints are polled every 200 milliseconds.

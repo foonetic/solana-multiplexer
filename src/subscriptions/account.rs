@@ -5,17 +5,20 @@ use crate::{
 };
 use std::str::FromStr;
 
+/// Clients may specify the encoding. The server supports all except json.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Subscription {
     pub encoding: Encoding,
 }
 
+/// Each pubkey and commitment result in a new subscription.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Metadata {
     pub pubkey: String,
     pub commitment: Commitment,
 }
 
+/// Handles account subscriptions.
 pub struct AccountSubscriptionHandler {
     tracker: SubscriptionTracker<Subscription, Metadata>,
 }
@@ -44,14 +47,18 @@ impl SubscriptionHandler<Subscription, Metadata> for AccountSubscriptionHandler 
         "accountUnsubscribe"
     }
 
+    /// Arbitrate websocket with HTTP.
     fn uses_pubsub() -> bool {
         true
     }
 
+    /// Arbitrate websocket with HTTP.
     fn uses_http() -> bool {
         true
     }
 
+    /// We always subscribe with base64 encoding and reformat to the client's
+    /// desired encoding.
     fn format_http_subscribe(id: &ServerInstructionID, metadata: &Metadata) -> String {
         format!(
             r#"{{"jsonrpc":"2.0","id":{},"method":"getAccountInfo","params":["{}",{{"encoding":"base64","commitment":"{}"}}]}}"#,
@@ -61,6 +68,8 @@ impl SubscriptionHandler<Subscription, Metadata> for AccountSubscriptionHandler 
         )
     }
 
+    /// We always subscribe with base64 encoding and reformat to the client's
+    /// desired encoding.
     fn format_pubsub_subscribe(id: &ServerInstructionID, metadata: &Metadata) -> String {
         format!(
             r#"{{"jsonrpc":"2.0","id":{},"method":"accountSubscribe","params":["{}",{{"encoding":"base64","commitment":"{}"}}]}}"#,
@@ -70,6 +79,8 @@ impl SubscriptionHandler<Subscription, Metadata> for AccountSubscriptionHandler 
         )
     }
 
+    /// Parses the user-specified pubkey and optional encoding and commitment.
+    /// Encoding defaults to base64 and commitment defaults to finalized.
     fn parse_subscription(request: &jsonrpc::Request) -> Result<(Subscription, Metadata), String> {
         let params = if let serde_json::Value::Array(params) = &request.params {
             Some(params)
@@ -91,34 +102,28 @@ impl SubscriptionHandler<Subscription, Metadata> for AccountSubscriptionHandler 
         }
         let pubkey = pubkey.unwrap();
 
-        let (encoding, commitment) = if let Some(serde_json::Value::Object(options)) = params.get(1)
-        {
-            let encoding =
-                if let Some(serde_json::Value::String(encoding)) = options.get("encoding") {
-                    Encoding::from_str(encoding)?
-                } else {
-                    Encoding::Base64
-                };
-            let commitment =
-                if let Some(serde_json::Value::String(commitment)) = options.get("commitment") {
-                    Commitment::from_str(commitment)?
-                } else {
-                    Commitment::Finalized
-                };
-            (encoding, commitment)
-        } else {
-            (Encoding::Base64, Commitment::Finalized)
+        let mut subscription = Subscription {
+            encoding: Encoding::Base64,
+        };
+        let mut metadata = Metadata {
+            pubkey: pubkey.clone(),
+            commitment: Commitment::Finalized,
         };
 
-        Ok((
-            Subscription { encoding },
-            Metadata {
-                pubkey: pubkey.clone(),
-                commitment,
-            },
-        ))
+        if let Some(serde_json::Value::Object(options)) = params.get(1) {
+            if let Some(serde_json::Value::String(encoding)) = options.get("encoding") {
+                subscription.encoding = Encoding::from_str(&encoding)?
+            };
+            if let Some(serde_json::Value::String(commitment)) = options.get("commitment") {
+                metadata.commitment = Commitment::from_str(&commitment)?
+            }
+        }
+        Ok((subscription, metadata))
     }
 
+    /// Transforms the base64-encoded output into the user's desired encoding.
+    /// Caches the decoded base64 data and the partially-decoded account
+    /// notification for reuse when formatting for multiple clients.
     fn format_notification(
         notification: &jsonrpc::Notification,
         subscription: &Subscription,
@@ -176,15 +181,9 @@ impl SubscriptionHandler<Subscription, Metadata> for AccountSubscriptionHandler 
         ))
     }
 
-    // As a special case, the getAccountInfo and accountSubscribe methods return
-    // the same data, so no post-processing is necessary.
+    /// The HTTP endpoint overrides the returned notification with this method
+    /// so that it can be processed consistently.
     fn poll_method() -> &'static str {
         "accountNotification"
-    }
-
-    fn transform_http_to_pubsub(
-        result: jsonrpc::Notification,
-    ) -> Result<jsonrpc::Notification, String> {
-        Ok(result)
     }
 }

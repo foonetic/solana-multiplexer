@@ -72,12 +72,7 @@ impl SubscriptionHandler<Subscription, Metadata> for RootSubscriptionHandler {
         ""
     }
 
-    fn transform_http_to_pubsub(
-        result: jsonrpc::Notification,
-    ) -> Result<jsonrpc::Notification, String> {
-        Ok(result)
-    }
-
+    /// The root returns only the slot as the result.
     fn get_notification_timestamp(notification: &jsonrpc::Notification) -> Option<u64> {
         if let serde_json::Value::Number(slot) = &notification.params.result {
             return slot.as_u64();

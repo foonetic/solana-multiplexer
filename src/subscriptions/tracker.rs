@@ -23,13 +23,12 @@ impl<S: Eq + Hash> PartialEq for Subscription<S> {
 
 /// Tracks client subscriptions to data. The subscription type S contains data
 /// related to how clients would like to view the data (for example, encoding).
-/// Each client is restricted to a single subscription for a given underlying
-/// data source. Underlying data sources are uniquified by metadata (for
-/// example, pubkey and commitment).
+/// Clients may subscribe to the same underlying source multiple times with
+/// different parameters represented by S.
 pub struct SubscriptionTracker<S: Eq + Hash, M: Eq + Hash + Clone> {
     client_to_subscriptions: HashMap<ClientID, HashSet<ServerInstructionID>>,
     subscription_to_clients: HashMap<ServerInstructionID, HashSet<Subscription<S>>>,
-    account_notifications: HashMap<ServerInstructionID, u64>,
+    latest_timestamp_seen: HashMap<ServerInstructionID, u64>,
 
     /// Subscriptions with the same metadata are considered equivalent, and will
     /// not result in a new subscription. For example, an account subscription
@@ -44,7 +43,7 @@ impl<S: Eq + Hash, M: Eq + Hash + Clone> SubscriptionTracker<S, M> {
         Self {
             client_to_subscriptions: HashMap::new(),
             subscription_to_clients: HashMap::new(),
-            account_notifications: HashMap::new(),
+            latest_timestamp_seen: HashMap::new(),
             metadata_to_subscription: HashMap::new(),
             subscription_to_metadata: HashMap::new(),
         }
@@ -75,6 +74,7 @@ impl<S: Eq + Hash, M: Eq + Hash + Clone> SubscriptionTracker<S, M> {
         (id, is_new)
     }
 
+    /// Tracks a new subscriber to a given subscription.
     fn track_subscriber(
         &mut self,
         client: &ClientID,
@@ -117,7 +117,7 @@ impl<S: Eq + Hash, M: Eq + Hash + Clone> SubscriptionTracker<S, M> {
         subscription: &ServerInstructionID,
         timestamp: u64,
     ) -> bool {
-        let latest = self.account_notifications.entry(subscription.clone());
+        let latest = self.latest_timestamp_seen.entry(subscription.clone());
         match latest {
             Entry::Vacant(entry) => {
                 entry.insert(timestamp);
@@ -134,6 +134,7 @@ impl<S: Eq + Hash, M: Eq + Hash + Clone> SubscriptionTracker<S, M> {
         }
     }
 
+    /// Returns all subscribers to the given subscription.
     pub fn get_notification_subscribers(
         &self,
         subscription: &ServerInstructionID,
@@ -158,6 +159,8 @@ impl<S: Eq + Hash, M: Eq + Hash + Clone> SubscriptionTracker<S, M> {
         )
     }
 
+    /// Helper function for returning a single subscription from the
+    /// subscriptions map.
     fn remove_single_subscription_from_map(
         subscription_to_clients: &mut HashMap<ServerInstructionID, HashSet<Subscription<S>>>,
         client: &ClientID,
@@ -193,6 +196,7 @@ impl<S: Eq + Hash, M: Eq + Hash + Clone> SubscriptionTracker<S, M> {
         }
     }
 
+    /// Helper function for returning subscription metadata from the map.
     fn remove_metadata_from_map(
         subscription: &ServerInstructionID,
         metadata_to_subscription: &mut HashMap<M, ServerInstructionID>,

@@ -72,12 +72,8 @@ impl SubscriptionHandler<Subscription, Metadata> for SlotSubscriptionHandler {
         ""
     }
 
-    fn transform_http_to_pubsub(
-        result: jsonrpc::Notification,
-    ) -> Result<jsonrpc::Notification, String> {
-        Ok(result)
-    }
-
+    /// The slot notification returns the slot number directly in the result
+    /// object instead of in a context.
     fn get_notification_timestamp(notification: &jsonrpc::Notification) -> Option<u64> {
         if let serde_json::Value::Object(result) = &notification.params.result {
             if let Some(serde_json::Value::Number(slot)) = result.get("slot") {

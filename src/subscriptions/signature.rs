@@ -111,10 +111,4 @@ impl SubscriptionHandler<Subscription, Metadata>
     fn poll_method() -> &'static str {
         ""
     }
-
-    fn transform_http_to_pubsub(
-        result: jsonrpc::Notification,
-    ) -> Result<jsonrpc::Notification, String> {
-        Ok(result)
-    }
 }

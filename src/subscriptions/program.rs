@@ -5,17 +5,23 @@ use crate::{
 };
 use std::str::FromStr;
 
+/// Clients may specify different encodings for account data.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Subscription {
     pub encoding: Encoding,
 }
 
+/// Clients may specify {"memcmp":{"offset":<>, "bytes":<>}}
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct MemCmp {
     pub offset: u64,
     pub bytes: String,
 }
 
+/// Clients must specify a pubkey and may optionally specify commitment, data
+/// size filters, and memcmp filters. In practice, passing multiple data sizes
+/// should return nothing, but we will replicate the query in case downstream
+/// clients rely on some specific corner case of the API.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Metadata {
     pub pubkey: String,
@@ -36,6 +42,8 @@ impl ProgramSubscriptionHandler {
     }
 }
 
+/// Holds the account data raw bytes and the deserialized notification to be
+/// reused for different requested encodings.
 pub struct FormatState {
     bytes: Vec<u8>,
     result: jsonrpc::ProgramNotificationResult,
@@ -56,6 +64,8 @@ impl SubscriptionHandler<Subscription, Metadata> for ProgramSubscriptionHandler 
         true
     }
 
+    /// Note that we do NOT currently arbitrate with getProgramAccounts, since
+    /// that call is relatively expensive.
     fn uses_http() -> bool {
         false
     }
@@ -64,6 +74,8 @@ impl SubscriptionHandler<Subscription, Metadata> for ProgramSubscriptionHandler 
         String::new()
     }
 
+    /// The subscription requests base64, which is re-encoded for each client
+    /// into the client's requested encoding.
     fn format_pubsub_subscribe(id: &ServerInstructionID, metadata: &Metadata) -> String {
         let mut filters = Vec::new();
         for s in metadata.data_size.iter() {
@@ -222,11 +234,5 @@ impl SubscriptionHandler<Subscription, Metadata> for ProgramSubscriptionHandler 
 
     fn poll_method() -> &'static str {
         ""
-    }
-
-    fn transform_http_to_pubsub(
-        result: jsonrpc::Notification,
-    ) -> Result<jsonrpc::Notification, String> {
-        Ok(result)
     }
 }

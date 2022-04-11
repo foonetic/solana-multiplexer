@@ -6,29 +6,69 @@ use std::{
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::{error, info};
 
+/// Generic subscription handler. The Subscription type holds client-specific
+/// parameters for how to materialize a notification. Metadata determines a
+/// unique subscription. For example, the client's desired encoding is a
+/// Subscription parameter, while the pubkey being subscribed to is part of the
+/// subscription Metadata.
+///
+/// A single notification corresponding to one Metadata will thus be reformatted
+/// potentially many times for each instance of Subscription. The FormatState
+/// will be passed in for each instance of Subscription on each notification and
+/// may be used to cache data useful for this re-serialization.
 pub trait SubscriptionHandler<Subscription: Eq + Hash + Clone, Metadata: Eq + Hash + Clone> {
+    /// Subscription-specific cache that is reused across Subscriptions for
+    /// every new notification. For example, if each Subscription corresponds to
+    /// a different encoding, FormatState may decode the base64 payload from the
+    /// notification and store the raw bytes that will be encoded multiple
+    /// times.
     type FormatState;
 
-    fn tracker_mut(
-        &mut self,
-    ) -> &mut SubscriptionTracker<Subscription, Metadata>;
+    /// Returns a subscription tracker.
+    fn tracker_mut(&mut self) -> &mut SubscriptionTracker<Subscription, Metadata>;
 
+    /// Returns the JSONRPC method to unsubscribe from a request.
     fn unsubscribe_method() -> &'static str;
+
+    /// Returns the JSONRPC method to set on an HTTP poll response. This is only
+    /// used if the subscription polls an HTTP endpoint.
     fn poll_method() -> &'static str;
+
+    /// Returns true if this subscription should use PusSub endpoints.
     fn uses_pubsub() -> bool;
+
+    /// Returns true if this subscription should use HTTP endpoints.
     fn uses_http() -> bool;
+
+    /// Returns the raw JSONRPC call for an HTTP poll.
     fn format_http_subscribe(id: &ServerInstructionID, metadata: &Metadata) -> String;
+
+    /// Returns the raw JSONRPC call for a PubSub subscribe.
     fn format_pubsub_subscribe(id: &ServerInstructionID, metadata: &Metadata) -> String;
+
+    /// Parses the raw client subscription and returns the Subscription, which
+    /// represents client-specific materialization parameters, and Metadata,
+    /// which represents a unique subscription. For example, different encodings
+    /// should correspond to the same underlying subscription, so encoding
+    /// should belong in Subscription. Different subscribed pubkeys should
+    /// correspond to different underlying subscriptions, so pubkey should be in
+    /// Metadata.
     fn parse_subscription(request: &jsonrpc::Request) -> Result<(Subscription, Metadata), String>;
+
+    /// Returns raw JSONRPC notification data, formatted with the Subscription
+    /// parameters. The state is shared across calls for a given notification.
+    /// For example, the state will be passed in for every different encoding
+    /// that a notification must be formatted to.
     fn format_notification(
         notification: &jsonrpc::Notification,
         subscription: &Subscription,
         state: &mut Option<Self::FormatState>,
     ) -> Result<String, String>;
-    fn transform_http_to_pubsub(
-        result: jsonrpc::Notification,
-    ) -> Result<jsonrpc::Notification, String>;
 
+    /// Returns a notion of timestamp for an input notification. Notifications
+    /// that are missing timestamps will be dropped. Only the most recent
+    /// notifications will be sent to clients. This function defaults to returning
+    /// params.result.context.slot, but some notifications may require customization.
     fn get_notification_timestamp(notification: &jsonrpc::Notification) -> Option<u64> {
         if let serde_json::Value::Object(result) = &notification.params.result {
             if let Some(serde_json::Value::Object(context)) = result.get("context") {
@@ -40,6 +80,9 @@ pub trait SubscriptionHandler<Subscription: Eq + Hash + Clone, Metadata: Eq + Ha
         return None;
     }
 
+    /// Subscribes a client to this data. The subscription handler is
+    /// responsible for parsing the request and forwarding appropriate messages
+    /// to the underlying endpoints.
     fn subscribe(
         &mut self,
         client: ClientID,
@@ -107,6 +150,11 @@ pub trait SubscriptionHandler<Subscription: Eq + Hash + Clone, Metadata: Eq + Ha
         }
     }
 
+    /// Unsubscribes a client from this data. The subscription handler is
+    /// responsible for parsing the request and forwarding appropriate messages
+    /// to the underlying endpoints if needed. Note that calling unsubscribe may
+    /// not unsubscribe from the endpoint if other clients are still
+    /// subscribing.
     fn unsubscribe(
         &mut self,
         client: ClientID,
@@ -173,6 +221,12 @@ pub trait SubscriptionHandler<Subscription: Eq + Hash + Clone, Metadata: Eq + Ha
         }
     }
 
+    /// Unsubscribes a client from all subscriptions managed by this handler.
+    /// The subscription handler is responsible for parsing the request and
+    /// forwarding appropriate messages to the underlying endpoints if needed.
+    /// Note that calling unsubscribe may not unsubscribe from the endpoint if
+    /// other clients are still subscribing. This method is commonly called on
+    /// client disconnect.
     fn unsubscribe_client(
         &mut self,
         client: ClientID,
@@ -200,6 +254,10 @@ pub trait SubscriptionHandler<Subscription: Eq + Hash + Clone, Metadata: Eq + Ha
         }
     }
 
+    /// Broadcasts a notification to all subscribed clients. The handler is
+    /// responsible for transforming the notification into the raw JSONRPC
+    /// replies that will be forwarded per each client's configured
+    /// Subscription.
     fn broadcast(
         &mut self,
         notification: jsonrpc::Notification,
@@ -249,6 +307,9 @@ pub trait SubscriptionHandler<Subscription: Eq + Hash + Clone, Metadata: Eq + Ha
         }
     }
 
+    /// Broadcasts a notification to all subscribed clients and then removes
+    /// subscription tracking without issuing an unsubscribe request. This
+    /// should be used for subscriptions that deliver only one notification.
     fn broadcast_and_unsubscribe(
         &mut self,
         notification: jsonrpc::Notification,
@@ -269,6 +330,9 @@ pub trait SubscriptionHandler<Subscription: Eq + Hash + Clone, Metadata: Eq + Ha
     }
 }
 
+/// Unsubscribes from all configured endpoints. For HTTP endpoints, this simply
+/// kills the polling task. For PubSub endpoints, this sends an unsubscribe
+/// message.
 fn remove_global_subscription(
     unsubscribe: &ServerInstructionID,
     next_instruction_id: &mut ServerInstructionID,
@@ -300,12 +364,14 @@ fn remove_global_subscription(
     }
 }
 
+/// Sends a string message to the client, logging on failure.
 fn send_string(send_to_client: UnboundedSender<ServerToClient>, message: String) {
     if let Err(err) = send_to_client.send(ServerToClient::Message(message)) {
         error!("server to client channel failure: {}", err);
     }
 }
 
+/// Sends a subscription response to the client, logging on failure.
 fn send_subscription_response(
     send_to_client: UnboundedSender<ServerToClient>,
     id: i64,
@@ -320,6 +386,7 @@ fn send_subscription_response(
     send_string(send_to_client, json);
 }
 
+/// Sends an unsubscribe response to the client, logging on failure.
 fn send_unsubscribe_response(send_to_client: UnboundedSender<ServerToClient>, id: i64) {
     let json = serde_json::to_string(&jsonrpc::UnsubscribeResponse {
         jsonrpc: "2.0".to_string(),
@@ -330,6 +397,7 @@ fn send_unsubscribe_response(send_to_client: UnboundedSender<ServerToClient>, id
     send_string(send_to_client, json);
 }
 
+/// Sends an error to the client, logging on failure.
 fn send_error(
     send_to_client: UnboundedSender<ServerToClient>,
     code: jsonrpc::ErrorCode,

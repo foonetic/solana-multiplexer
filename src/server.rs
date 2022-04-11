@@ -4,6 +4,8 @@ use crate::{
     client::ClientHandler,
     endpoint::{self, EndpointConfig},
     jsonrpc,
+    logs_subscription::LogsSubscriptionHandler,
+    program_subscription::ProgramSubscriptionHandler,
     subscription_handler::SubscriptionHandler,
 };
 use hyper::service::{make_service_fn, service_fn};
@@ -26,6 +28,8 @@ pub struct Server {
     send_to_client: HashMap<ClientID, UnboundedSender<ServerToClient>>,
 
     account_subscriptions: AccountSubscriptionHandler,
+    logs_subscriptions: LogsSubscriptionHandler,
+    program_subscriptions: ProgramSubscriptionHandler,
 }
 
 impl Server {
@@ -46,6 +50,8 @@ impl Server {
             send_to_pubsub: Vec::new(),
             send_to_client: HashMap::new(),
             account_subscriptions: AccountSubscriptionHandler::new(),
+            logs_subscriptions: LogsSubscriptionHandler::new(),
+            program_subscriptions: ProgramSubscriptionHandler::new(),
         }
     }
 
@@ -159,6 +165,18 @@ impl Server {
                     self.send_to_pubsub.as_slice(),
                     self.send_to_http.as_slice(),
                 );
+                self.logs_subscriptions.unsubscribe_client(
+                    client.clone(),
+                    &mut self.next_instruction_id,
+                    self.send_to_pubsub.as_slice(),
+                    self.send_to_http.as_slice(),
+                );
+                self.program_subscriptions.unsubscribe_client(
+                    client.clone(),
+                    &mut self.next_instruction_id,
+                    self.send_to_pubsub.as_slice(),
+                    self.send_to_http.as_slice(),
+                );
             }
 
             ClientToServer::PubSubRequest { client, request } => {
@@ -183,6 +201,14 @@ impl Server {
         match notification.method.as_str() {
             "accountNotification" => {
                 self.account_subscriptions
+                    .broadcast(notification, &self.send_to_client);
+            }
+            "logsNotification" => {
+                self.logs_subscriptions
+                    .broadcast(notification, &self.send_to_client);
+            }
+            "programNotification" => {
+                self.program_subscriptions
                     .broadcast(notification, &self.send_to_client);
             }
             unknown => {
@@ -214,6 +240,46 @@ impl Server {
             }
             "accountUnsubscribe" => {
                 self.account_subscriptions.unsubscribe(
+                    client,
+                    &request,
+                    &mut self.next_instruction_id,
+                    send_to_client.clone(),
+                    self.send_to_pubsub.as_slice(),
+                    self.send_to_http.as_slice(),
+                );
+            }
+            "logsSubscribe" => {
+                self.logs_subscriptions.subscribe(
+                    client,
+                    &request,
+                    &mut self.next_instruction_id,
+                    send_to_client.clone(),
+                    self.send_to_pubsub.as_slice(),
+                    &self.send_to_http.as_slice(),
+                );
+            }
+            "logsUnsubscribe" => {
+                self.logs_subscriptions.unsubscribe(
+                    client,
+                    &request,
+                    &mut self.next_instruction_id,
+                    send_to_client.clone(),
+                    self.send_to_pubsub.as_slice(),
+                    self.send_to_http.as_slice(),
+                );
+            }
+            "programSubscribe" => {
+                self.program_subscriptions.subscribe(
+                    client,
+                    &request,
+                    &mut self.next_instruction_id,
+                    send_to_client.clone(),
+                    self.send_to_pubsub.as_slice(),
+                    &self.send_to_http.as_slice(),
+                );
+            }
+            "programUnsubscribe" => {
+                self.program_subscriptions.unsubscribe(
                     client,
                     &request,
                     &mut self.next_instruction_id,

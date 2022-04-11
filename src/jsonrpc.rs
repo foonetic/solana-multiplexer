@@ -81,3 +81,15 @@ pub struct UnsubscribeResponse {
     pub result: bool,
     pub id: i64,
 }
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ProgramNotificationResult {
+    pub context: ContextWithSlot,
+    pub value: ProgramNotificationValue,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ProgramNotificationValue {
+    pub pubkey: String,
+    pub account: AccountNotificationValue,
+}

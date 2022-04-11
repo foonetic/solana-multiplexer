@@ -3,6 +3,8 @@ mod channel_types;
 mod client;
 mod endpoint;
 mod jsonrpc;
+mod logs_subscription;
+mod program_subscription;
 pub mod server;
 mod subscription_handler;
 mod subscription_tracker;

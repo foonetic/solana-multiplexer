@@ -144,8 +144,16 @@ impl PubsubEndpoint {
                     );
                 }
             }
-        } else if let Ok(reply) = serde_json::from_value::<jsonrpc::SubscribeResponse>(value) {
+        } else if let Ok(reply) =
+            serde_json::from_value::<jsonrpc::SubscribeResponse>(value.clone())
+        {
             self.on_subscribe_reply(reply);
+        } else if let Ok(reply) =
+            serde_json::from_value::<jsonrpc::UnsubscribeResponse>(value.clone())
+        {
+            info!("unsubscribe confirmed for request {}", reply.id);
+        } else {
+            info!("unhandled reply: {:?}", value);
         }
     }
 

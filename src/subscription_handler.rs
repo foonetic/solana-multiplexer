@@ -19,7 +19,6 @@ pub trait SubscriptionHandler<Subscription: Eq + Hash + Clone, Metadata: Eq + Ha
     fn uses_http() -> bool;
     fn format_http_subscribe(id: &ServerInstructionID, metadata: &Metadata) -> String;
     fn format_pubsub_subscribe(id: &ServerInstructionID, metadata: &Metadata) -> String;
-    fn get_notification_timestamp(notification: &jsonrpc::Notification) -> Option<u64>;
     fn parse_subscription(request: &jsonrpc::Request) -> Result<(Subscription, Metadata), String>;
     fn format_notification(
         notification: &jsonrpc::Notification,
@@ -29,6 +28,17 @@ pub trait SubscriptionHandler<Subscription: Eq + Hash + Clone, Metadata: Eq + Ha
     fn transform_http_to_pubsub(
         result: jsonrpc::Notification,
     ) -> Result<jsonrpc::Notification, String>;
+
+    fn get_notification_timestamp(notification: &jsonrpc::Notification) -> Option<u64> {
+        if let serde_json::Value::Object(result) = &notification.params.result {
+            if let Some(serde_json::Value::Object(context)) = result.get("context") {
+                if let Some(serde_json::Value::Number(slot)) = context.get("slot") {
+                    return slot.as_u64();
+                }
+            }
+        }
+        return None;
+    }
 
     fn subscribe(
         &mut self,

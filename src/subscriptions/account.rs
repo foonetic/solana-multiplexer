@@ -191,7 +191,7 @@ impl SubscriptionHandler<Subscription, Metadata> for AccountSubscriptionHandler 
     /// broadcast notifications when the data has changed.
     fn notification_unique_key(notification: &jsonrpc::Notification) -> Option<String> {
         if let serde_json::Value::Object(result) = &notification.params.result {
-            if let Some(serde_json::Value::Object(value)) = result.get("data") {
+            if let Some(serde_json::Value::Object(value)) = result.get("value") {
                 if let Some(serde_json::Value::Array(data)) = value.get("data") {
                     if let Some(serde_json::Value::String(string)) = data.get(0) {
                         return Some(string.clone());
@@ -200,5 +200,430 @@ impl SubscriptionHandler<Subscription, Metadata> for AccountSubscriptionHandler 
             }
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{from_str, json, Value};
+
+    #[test]
+    fn format_http_subscribe() {
+        let metadata = Metadata {
+            pubkey: String::from("hear ye hear ye"),
+            commitment: Commitment::Confirmed,
+        };
+        let id = ServerInstructionID(42);
+
+        let got = AccountSubscriptionHandler::format_http_subscribe(&id, &metadata);
+        assert_eq!(
+            from_str::<Value>(&got).unwrap(),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 42,
+                "method": "getAccountInfo",
+                "params": [
+                    "hear ye hear ye",
+                    {
+                        "encoding": "base64",
+                        "commitment": "confirmed",
+                    }
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn format_pubsub_subscribe() {
+        let metadata = Metadata {
+            pubkey: String::from("hear ye hear ye"),
+            commitment: Commitment::Confirmed,
+        };
+        let id = ServerInstructionID(42);
+
+        let got = AccountSubscriptionHandler::format_pubsub_subscribe(&id, &metadata);
+        assert_eq!(
+            from_str::<Value>(&got).unwrap(),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 42,
+                "method": "accountSubscribe",
+                "params": [
+                    "hear ye hear ye",
+                    {
+                        "encoding": "base64",
+                        "commitment": "confirmed",
+                    }
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn parse_subscription_fails_without_params() {
+        let request = jsonrpc::Request {
+            jsonrpc: "2.0".to_string(),
+            method: "accountSubscribe".to_string(),
+            id: 42,
+            params: None,
+        };
+        let result = AccountSubscriptionHandler::parse_subscription(&request);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_subscription_fails_with_non_array_params() {
+        let request = jsonrpc::Request {
+            jsonrpc: "2.0".to_string(),
+            method: "accountSubscribe".to_string(),
+            id: 42,
+            params: Some(serde_json::Value::String("what's up?".to_string())),
+        };
+        let result = AccountSubscriptionHandler::parse_subscription(&request);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_subscription_fails_with_missing_pubkey() {
+        let request = jsonrpc::Request {
+            jsonrpc: "2.0".to_string(),
+            method: "accountSubscribe".to_string(),
+            id: 42,
+            params: Some(serde_json::Value::Array(vec![])),
+        };
+        let result = AccountSubscriptionHandler::parse_subscription(&request);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_subscription_fails_with_non_string_pubkey() {
+        let request = jsonrpc::Request {
+            jsonrpc: "2.0".to_string(),
+            method: "accountSubscribe".to_string(),
+            id: 42,
+            params: Some(serde_json::Value::Array(vec![serde_json::Value::Bool(
+                true,
+            )])),
+        };
+        let result = AccountSubscriptionHandler::parse_subscription(&request);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_subscription_with_pubkey() {
+        let request = jsonrpc::Request {
+            jsonrpc: "2.0".to_string(),
+            method: "accountSubscribe".to_string(),
+            id: 42,
+            params: Some(serde_json::json!(["hello world"])),
+        };
+        let result = AccountSubscriptionHandler::parse_subscription(&request);
+        assert!(result.is_ok());
+        let (subscription, metadata) = result.unwrap();
+        assert_eq!(
+            subscription,
+            Subscription {
+                encoding: Encoding::Base64,
+            }
+        );
+        assert_eq!(
+            metadata,
+            Metadata {
+                pubkey: "hello world".to_string(),
+                commitment: Commitment::Finalized,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_subscription_with_encoding() {
+        let request = jsonrpc::Request {
+            jsonrpc: "2.0".to_string(),
+            method: "accountSubscribe".to_string(),
+            id: 42,
+            params: Some(serde_json::json!(["hello world", {"encoding": "base58"}])),
+        };
+        let result = AccountSubscriptionHandler::parse_subscription(&request);
+        assert!(result.is_ok());
+        let (subscription, metadata) = result.unwrap();
+        assert_eq!(
+            subscription,
+            Subscription {
+                encoding: Encoding::Base58,
+            }
+        );
+        assert_eq!(
+            metadata,
+            Metadata {
+                pubkey: "hello world".to_string(),
+                commitment: Commitment::Finalized,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_subscription_with_commitment() {
+        let request = jsonrpc::Request {
+            jsonrpc: "2.0".to_string(),
+            method: "accountSubscribe".to_string(),
+            id: 42,
+            params: Some(
+                serde_json::json!(["hello world", {"encoding": "base58", "commitment": "processed"}]),
+            ),
+        };
+        let result = AccountSubscriptionHandler::parse_subscription(&request);
+        assert!(result.is_ok());
+        let (subscription, metadata) = result.unwrap();
+        assert_eq!(
+            subscription,
+            Subscription {
+                encoding: Encoding::Base58,
+            }
+        );
+        assert_eq!(
+            metadata,
+            Metadata {
+                pubkey: "hello world".to_string(),
+                commitment: Commitment::Processed,
+            }
+        );
+    }
+
+    #[test]
+    fn format_notification_without_state() {
+        let mut state = None;
+        let notification = jsonrpc::Notification {
+            jsonrpc: "2.0".to_string(),
+            method: "accountNotification".to_string(),
+            params: jsonrpc::NotificationParams {
+                subscription: 42,
+                result: json!({
+                    "context": {
+                        "slot": 1234,
+                    },
+                    "value": {
+                        "data": [
+                            base64::encode(b"google en passant"),
+                            "base64",
+                        ],
+                        "executable": false,
+                        "lamports": 987,
+                        "owner": "blair_witch",
+                        "rentEpoch": 999,
+                    }
+                }),
+            },
+        };
+
+        let subscription = Subscription {
+            encoding: Encoding::Base64,
+        };
+
+        let result = AccountSubscriptionHandler::format_notification(
+            &notification,
+            &subscription,
+            &mut state,
+        );
+        assert!(state.is_none());
+        assert!(result.is_ok());
+        let result = result.unwrap();
+        let result = from_str::<Value>(&result).unwrap();
+
+        assert_eq!(
+            result,
+            json!({
+                "jsonrpc": "2.0",
+                "method": "accountNotification",
+                "params": {
+                    "subscription": 42,
+                    "result": {
+                        "context": {
+                            "slot": 1234,
+                        },
+                        "value": {
+                            "data": [
+                                base64::encode(b"google en passant"),
+                                "base64",
+                            ],
+                            "executable": false,
+                            "lamports": 987,
+                            "owner": "blair_witch",
+                            "rentEpoch": 999,
+                        }
+                    }
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn format_notification_base58() {
+        let mut state = None;
+        let notification = jsonrpc::Notification {
+            jsonrpc: "2.0".to_string(),
+            method: "accountNotification".to_string(),
+            params: jsonrpc::NotificationParams {
+                subscription: 42,
+                result: json!({
+                    "context": {
+                        "slot": 1234,
+                    },
+                    "value": {
+                        "data": [
+                            base64::encode(b"google en passant"),
+                            "base64",
+                        ],
+                        "executable": false,
+                        "lamports": 987,
+                        "owner": "blair_witch",
+                        "rentEpoch": 999,
+                    }
+                }),
+            },
+        };
+
+        let subscription = Subscription {
+            encoding: Encoding::Base58,
+        };
+
+        let result = AccountSubscriptionHandler::format_notification(
+            &notification,
+            &subscription,
+            &mut state,
+        );
+        assert!(state.is_some());
+        assert!(result.is_ok());
+        let result = result.unwrap();
+        let result = from_str::<Value>(&result).unwrap();
+
+        assert_eq!(
+            result,
+            json!({
+                "jsonrpc": "2.0",
+                "method": "accountNotification",
+                "params": {
+                    "subscription": 42,
+                    "result": {
+                        "context": {
+                            "slot": 1234,
+                        },
+                        "value": {
+                            "data": [
+                                bs58::encode(b"google en passant").into_string(),
+                                "base58",
+                            ],
+                            "executable": false,
+                            "lamports": 987,
+                            "owner": "blair_witch",
+                            "rentEpoch": 999,
+                        }
+                    }
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn format_notification_base64_zstd() {
+        let mut state = None;
+        let notification = jsonrpc::Notification {
+            jsonrpc: "2.0".to_string(),
+            method: "accountNotification".to_string(),
+            params: jsonrpc::NotificationParams {
+                subscription: 42,
+                result: json!({
+                    "context": {
+                        "slot": 1234,
+                    },
+                    "value": {
+                        "data": [
+                            base64::encode(b"google en passant"),
+                            "base64",
+                        ],
+                        "executable": false,
+                        "lamports": 987,
+                        "owner": "blair_witch",
+                        "rentEpoch": 999,
+                    }
+                }),
+            },
+        };
+
+        let subscription = Subscription {
+            encoding: Encoding::Base64Zstd,
+        };
+
+        let result = AccountSubscriptionHandler::format_notification(
+            &notification,
+            &subscription,
+            &mut state,
+        );
+        assert!(state.is_some());
+        assert!(result.is_ok());
+        let result = result.unwrap();
+        let result = from_str::<Value>(&result).unwrap();
+
+        let compressed = zstd::stream::encode_all(b"google en passant".as_slice(), 0).unwrap();
+
+        assert_eq!(
+            result,
+            json!({
+                "jsonrpc": "2.0",
+                "method": "accountNotification",
+                "params": {
+                    "subscription": 42,
+                    "result": {
+                        "context": {
+                            "slot": 1234,
+                        },
+                        "value": {
+                            "data": [
+                                base64::encode(compressed),
+                                "base64+zstd",
+                            ],
+                            "executable": false,
+                            "lamports": 987,
+                            "owner": "blair_witch",
+                            "rentEpoch": 999,
+                        }
+                    }
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn notification_unique_key() {
+        let notification = jsonrpc::Notification {
+            jsonrpc: "2.0".to_string(),
+            method: "accountNotification".to_string(),
+            params: jsonrpc::NotificationParams {
+                subscription: 42,
+                result: json!({
+                    "context": {
+                        "slot": 1234,
+                    },
+                    "value": {
+                        "data": [
+                            base64::encode(b"google en passant"),
+                            "base64",
+                        ],
+                        "executable": false,
+                        "lamports": 987,
+                        "owner": "blair_witch",
+                        "rentEpoch": 999,
+                    }
+                }),
+            },
+        };
+        assert_eq!(
+            AccountSubscriptionHandler::notification_unique_key(&notification),
+            Some(base64::encode(b"google en passant"))
+        );
     }
 }

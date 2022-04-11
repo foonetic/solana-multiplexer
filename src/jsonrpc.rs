@@ -28,6 +28,13 @@ pub struct Request {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct Response {
+    pub jsonrpc: String,
+    pub id: i64,
+    pub result: serde_json::Value,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Notification {
     pub jsonrpc: String,
     pub method: String,
@@ -38,19 +45,6 @@ pub struct Notification {
 pub struct NotificationParams {
     pub result: serde_json::Value,
     pub subscription: i64,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct NotificationResultWithContext {
-    pub context: ContextWithSlot,
-    pub value: serde_json::Value,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct AccountInfo {
-    pub jsonrpc: String,
-    pub result: AccountNotificationResult,
-    pub id: i64,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

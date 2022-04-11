@@ -13,13 +13,12 @@ pub trait SubscriptionHandler<Subscription: Eq + Hash + Clone, Metadata: Eq + Ha
         &mut self,
     ) -> &mut subscription_tracker::SubscriptionTracker<Subscription, Metadata>;
 
-    fn notification_method() -> &'static str;
     fn unsubscribe_method() -> &'static str;
+    fn poll_method() -> &'static str;
     fn uses_pubsub() -> bool;
     fn uses_http() -> bool;
     fn format_http_subscribe(id: &ServerInstructionID, metadata: &Metadata) -> String;
     fn format_pubsub_subscribe(id: &ServerInstructionID, metadata: &Metadata) -> String;
-    fn subscription_type() -> SubscriptionType;
     fn get_notification_timestamp(notification: &jsonrpc::Notification) -> Option<u64>;
     fn parse_subscription(request: &jsonrpc::Request) -> Result<(Subscription, Metadata), String>;
     fn format_notification(
@@ -27,6 +26,9 @@ pub trait SubscriptionHandler<Subscription: Eq + Hash + Clone, Metadata: Eq + Ha
         subscription: &Subscription,
         state: &mut Option<Self::FormatState>,
     ) -> Result<String, String>;
+    fn transform_http_to_pubsub(
+        result: jsonrpc::Notification,
+    ) -> Result<jsonrpc::Notification, String>;
 
     fn subscribe(
         &mut self,
@@ -63,7 +65,6 @@ pub trait SubscriptionHandler<Subscription: Eq + Hash + Clone, Metadata: Eq + Ha
                                 .send(ServerToPubsub::Subscribe {
                                     subscription: subscription_id.clone(),
                                     request: request.clone(),
-                                    subscription_type: Self::subscription_type(),
                                 })
                                 .expect("pubsub endpoint channel died");
                         }
@@ -75,7 +76,7 @@ pub trait SubscriptionHandler<Subscription: Eq + Hash + Clone, Metadata: Eq + Ha
                                 .send(ServerToHTTP::Subscribe {
                                     subscription: subscription_id.clone(),
                                     request: request.clone(),
-                                    subscription_type: Self::subscription_type(),
+                                    method: Self::poll_method().to_string(),
                                 })
                                 .expect("pubsub endpoint channel died");
                         }
@@ -148,6 +149,7 @@ pub trait SubscriptionHandler<Subscription: Eq + Hash + Clone, Metadata: Eq + Ha
                     } else {
                         None
                     },
+                    Self::unsubscribe_method(),
                 );
             }
         } else {
@@ -183,6 +185,7 @@ pub trait SubscriptionHandler<Subscription: Eq + Hash + Clone, Metadata: Eq + Ha
                 } else {
                     None
                 },
+                Self::unsubscribe_method(),
             );
         }
     }
@@ -242,6 +245,7 @@ fn remove_global_subscription(
     next_instruction_id: &mut ServerInstructionID,
     pubsub_senders: Option<&[UnboundedSender<ServerToPubsub>]>,
     http_senders: Option<&[UnboundedSender<ServerToHTTP>]>,
+    unsubscribe_method: &str,
 ) {
     let instruction_id = next_instruction_id.clone();
     next_instruction_id.0 += 1;
@@ -259,6 +263,7 @@ fn remove_global_subscription(
             if let Err(err) = endpoint.send(ServerToPubsub::Unsubscribe {
                 request_id: instruction_id.clone(),
                 subscription: unsubscribe.clone(),
+                method: unsubscribe_method.to_string(),
             }) {
                 error!("server to pubsub channel failure: {}", err);
             }

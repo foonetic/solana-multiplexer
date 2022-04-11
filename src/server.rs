@@ -180,9 +180,17 @@ impl Server {
     }
 
     fn process_notification(&mut self, notification: jsonrpc::Notification) {
-        if notification.method.as_str() == AccountSubscriptionHandler::notification_method() {
-            self.account_subscriptions
-                .broadcast(notification, &self.send_to_client);
+        match notification.method.as_str() {
+            "accountNotification" => {
+                self.account_subscriptions
+                    .broadcast(notification, &self.send_to_client);
+            }
+            unknown => {
+                info!(
+                    "saw unknown notification method {}: {:?}",
+                    unknown, notification,
+                );
+            }
         }
     }
 

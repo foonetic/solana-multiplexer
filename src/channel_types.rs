@@ -96,26 +96,10 @@ pub enum ServerToHTTP {
     Subscribe {
         subscription: ServerInstructionID,
         request: String,
-        subscription_type: SubscriptionType,
+        method: String,
     },
     Unsubscribe(ServerInstructionID),
     DirectRequest(jsonrpc::Request, UnboundedSender<ServerToClient>),
-}
-
-#[derive(Debug)]
-pub enum SubscriptionType {
-    Account,
-    Logs,
-}
-
-impl SubscriptionType {
-    pub fn to_unsubscribe_method(&self) -> String {
-        match *self {
-            SubscriptionType::Account => "accountUnsubscribe",
-            SubscriptionType::Logs => "logsUnsubscribe",
-        }
-        .to_string()
-    }
 }
 
 #[derive(Debug)]
@@ -123,11 +107,11 @@ pub enum ServerToPubsub {
     Subscribe {
         subscription: ServerInstructionID,
         request: String,
-        subscription_type: SubscriptionType,
     },
     Unsubscribe {
         request_id: ServerInstructionID,
         subscription: ServerInstructionID,
+        method: String,
     },
 }
 

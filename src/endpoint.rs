@@ -37,7 +37,6 @@ pub struct PubsubEndpoint {
     receive_from_server: UnboundedReceiver<ServerToPubsub>,
     global_to_local_subscriber: HashMap<ServerInstructionID, EndpointSubscriberID>,
     local_to_global_subscriber: HashMap<EndpointSubscriberID, ServerInstructionID>,
-    global_to_type: HashMap<ServerInstructionID, SubscriptionType>,
 }
 
 impl PubsubEndpoint {
@@ -65,7 +64,6 @@ impl PubsubEndpoint {
             receive_from_server,
             global_to_local_subscriber: HashMap::new(),
             local_to_global_subscriber: HashMap::new(),
-            global_to_type: HashMap::new(),
         }
     }
 
@@ -167,7 +165,6 @@ impl PubsubEndpoint {
             ServerToPubsub::Subscribe {
                 subscription,
                 request,
-                subscription_type,
             } => {
                 info!(
                     "pubsub endpoint subscribing to global id {}",
@@ -176,31 +173,28 @@ impl PubsubEndpoint {
                 if let Err(err) = self.enqueue.send(Message::Text(request)) {
                     error!("failed to enqueue pubsub write: {}", err);
                 }
-                self.global_to_type.insert(subscription, subscription_type);
             }
 
             ServerToPubsub::Unsubscribe {
                 request_id,
                 subscription,
+                method,
             } => {
                 let entry = self.global_to_local_subscriber.entry(subscription.clone());
-                let subscription_type = self.global_to_type.remove(&subscription);
                 match entry {
                     Entry::Occupied(got) => {
                         info!(
                             "pubsub endpoint unsubscribing to global id {}",
                             subscription.0,
                         );
-                        if let Some(subscription_type) = subscription_type {
-                            let instruction = format!(
-                                r#"{{"jsonrpc":"2.0","id":{},"method":"{}","params":[{}]}}"#,
-                                request_id.0,
-                                subscription_type.to_unsubscribe_method(),
-                                got.get().0,
-                            );
-                            if let Err(err) = self.enqueue.send(Message::Text(instruction)) {
-                                error!("failed to enqueue pubsub write: {}", err);
-                            }
+                        let instruction = format!(
+                            r#"{{"jsonrpc":"2.0","id":{},"method":"{}","params":[{}]}}"#,
+                            request_id.0,
+                            method,
+                            got.get().0,
+                        );
+                        if let Err(err) = self.enqueue.send(Message::Text(instruction)) {
+                            error!("failed to enqueue pubsub write: {}", err);
                         }
                         self.local_to_global_subscriber.remove(&got.remove());
                     }
@@ -219,6 +213,7 @@ struct HTTPPoll {
     instruction: String,
     unsubscribe: oneshot::Receiver<bool>,
     send: UnboundedSender<EndpointToServer>,
+    method: String,
 }
 
 impl HTTPPoll {
@@ -229,6 +224,7 @@ impl HTTPPoll {
         instruction: String,
         unsubscribe: oneshot::Receiver<bool>,
         send: UnboundedSender<EndpointToServer>,
+        method: String,
     ) -> Self {
         HTTPPoll {
             client,
@@ -237,6 +233,7 @@ impl HTTPPoll {
             instruction,
             unsubscribe,
             send,
+            method,
         }
     }
 
@@ -265,23 +262,17 @@ impl HTTPPoll {
             .await
         {
             if let Ok(text) = result.text().await {
-                if let Ok(account_info) = serde_json::from_str::<jsonrpc::AccountInfo>(&text) {
-                    // The websocket account notification has a
-                    // different format from the getAccountInfo RPC
-                    // endpoint. Reformat everything to look like the
-                    // websocket format. Downstream clients will only
-                    // subscribe to the websocket.
+                if let Ok(response) = serde_json::from_str::<jsonrpc::Response>(&text) {
+                    // Reformat to look like a websocket reply.
                     let notification = jsonrpc::Notification {
-                        jsonrpc: account_info.jsonrpc,
-                        method: "accountNotification".to_string(),
+                        jsonrpc: response.jsonrpc,
+                        method: self.method.clone(),
                         params: jsonrpc::NotificationParams {
-                            result: serde_json::to_value(account_info.result)
-                                .expect("unable to convert to JSON value"),
-                            subscription: account_info.id,
+                            result: response.result,
+                            subscription: response.id,
                         },
                     };
                     // Let the query fail since we will retry momentarily.
-                    // TODO: Limit retries, throttle.
                     if let Err(err) = self.send.send(EndpointToServer::Notification(notification)) {
                         error!(
                             "http endpoint {} failed to poll: {}",
@@ -341,12 +332,8 @@ impl HTTPEndpoint {
             ServerToHTTP::Subscribe {
                 subscription,
                 request,
-                subscription_type,
+                method,
             } => {
-                if !matches!(subscription_type, SubscriptionType::Account) {
-                    return;
-                }
-
                 info!(
                     "http endpoint {} subscribing to global id {}",
                     self.url.as_str(),
@@ -362,6 +349,7 @@ impl HTTPEndpoint {
                     request,
                     receive_unsubscribe,
                     self.send_to_server.clone(),
+                    method,
                 );
                 tokio::spawn(async move {
                     poll.run().await;

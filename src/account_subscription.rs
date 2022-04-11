@@ -40,10 +40,6 @@ impl subscription_handler::SubscriptionHandler<Subscription, Metadata>
         &mut self.tracker
     }
 
-    fn notification_method() -> &'static str {
-        "accountNotification"
-    }
-
     fn unsubscribe_method() -> &'static str {
         "accountUnsubscribe"
     }
@@ -72,10 +68,6 @@ impl subscription_handler::SubscriptionHandler<Subscription, Metadata>
             metadata.pubkey.to_string(),
             metadata.commitment.to_string()
         )
-    }
-
-    fn subscription_type() -> SubscriptionType {
-        SubscriptionType::Account
     }
 
     fn get_notification_timestamp(notification: &jsonrpc::Notification) -> Option<u64> {
@@ -193,5 +185,17 @@ impl subscription_handler::SubscriptionHandler<Subscription, Metadata>
             r#"{{"jsonrpc":"2.0","method":"accountNotification","params":{{"subscription":{},"result":{}}}}}"#,
             notification.params.subscription, result
         ))
+    }
+
+    // As a special case, the getAccountInfo and accountSubscribe methods return
+    // the same data, so no post-processing is necessary.
+    fn poll_method() -> &'static str {
+        "accountNotification"
+    }
+
+    fn transform_http_to_pubsub(
+        result: jsonrpc::Notification,
+    ) -> Result<jsonrpc::Notification, String> {
+        Ok(result)
     }
 }

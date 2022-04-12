@@ -129,17 +129,250 @@ impl SubscriptionHandler<Subscription, Metadata> for LogsSubscriptionHandler {
         Ok((Subscription {}, metadata))
     }
 
-    fn format_notification(
-        notification: &jsonrpc::Notification,
-        _subscription: &Subscription,
-        _state: &mut Option<FormatState>,
-    ) -> Result<String, String> {
-        let result = serde_json::to_string(notification)
-            .map_err(|e| format!("serialization error: {}", e))?;
-        Ok(result)
-    }
-
     fn poll_method() -> &'static str {
         ""
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{from_str, json, Value};
+
+    #[test]
+    fn format_pubsub_subscribe() {
+        let metadata = Metadata {
+            is_all: false,
+            is_all_with_votes: false,
+            sorted_mentions: vec![],
+            commitment: Commitment::Processed,
+        };
+        let id = ServerInstructionID(42);
+
+        let got = LogsSubscriptionHandler::format_pubsub_subscribe(&id, &metadata);
+        assert_eq!(
+            from_str::<Value>(&got).unwrap(),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 42,
+                "method": "logsSubscribe",
+                "params": [
+                    {
+                        "commitment": "processed",
+                    }
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn format_pubsub_subscribe_is_all() {
+        let metadata = Metadata {
+            is_all: true,
+            is_all_with_votes: false,
+            sorted_mentions: vec![],
+            commitment: Commitment::Confirmed,
+        };
+        let id = ServerInstructionID(42);
+
+        let got = LogsSubscriptionHandler::format_pubsub_subscribe(&id, &metadata);
+        assert_eq!(
+            from_str::<Value>(&got).unwrap(),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 42,
+                "method": "logsSubscribe",
+                "params": [
+                    "all",
+                    {
+                        "commitment": "confirmed",
+                    }
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn format_pubsub_subscribe_is_all_with_votes() {
+        let metadata = Metadata {
+            is_all: false,
+            is_all_with_votes: true,
+            sorted_mentions: vec![],
+            commitment: Commitment::Processed,
+        };
+        let id = ServerInstructionID(42);
+
+        let got = LogsSubscriptionHandler::format_pubsub_subscribe(&id, &metadata);
+        assert_eq!(
+            from_str::<Value>(&got).unwrap(),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 42,
+                "method": "logsSubscribe",
+                "params": [
+                    "allWithVotes",
+                    {
+                        "commitment": "processed",
+                    }
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn format_pubsub_subscribe_mentions() {
+        let metadata = Metadata {
+            is_all: false,
+            is_all_with_votes: false,
+            sorted_mentions: vec![
+                "first".to_string(),
+                "second".to_string(),
+                "third".to_string(),
+            ],
+            commitment: Commitment::Processed,
+        };
+        let id = ServerInstructionID(42);
+
+        let got = LogsSubscriptionHandler::format_pubsub_subscribe(&id, &metadata);
+        assert_eq!(
+            from_str::<Value>(&got).unwrap(),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 42,
+                "method": "logsSubscribe",
+                "params": [
+                    {"mentions": ["first"]},
+                    {"mentions": ["second"]},
+                    {"mentions": ["third"]},
+                    {
+                        "commitment": "processed",
+                    }
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn parse_subscription_fails_without_params() {
+        let request = jsonrpc::Request {
+            jsonrpc: "2.0".to_string(),
+            method: "accountSubscribe".to_string(),
+            id: 42,
+            params: None,
+        };
+        let result = LogsSubscriptionHandler::parse_subscription(&request);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_subscription_fails_with_non_array_params() {
+        let request = jsonrpc::Request {
+            jsonrpc: "2.0".to_string(),
+            method: "accountSubscribe".to_string(),
+            id: 42,
+            params: Some(serde_json::Value::String("what's up?".to_string())),
+        };
+        let result = LogsSubscriptionHandler::parse_subscription(&request);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_subscription_with_all() {
+        let request = jsonrpc::Request {
+            jsonrpc: "2.0".to_string(),
+            method: "accountSubscribe".to_string(),
+            id: 42,
+            params: Some(serde_json::json!(["all"])),
+        };
+        let result = LogsSubscriptionHandler::parse_subscription(&request);
+        assert!(result.is_ok());
+        let (subscription, metadata) = result.unwrap();
+        assert_eq!(subscription, Subscription {});
+        assert_eq!(
+            metadata,
+            Metadata {
+                is_all: true,
+                is_all_with_votes: false,
+                sorted_mentions: Vec::new(),
+                commitment: Commitment::Finalized,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_subscription_with_all_with_votes() {
+        let request = jsonrpc::Request {
+            jsonrpc: "2.0".to_string(),
+            method: "accountSubscribe".to_string(),
+            id: 42,
+            params: Some(serde_json::json!(["allWithVotes"])),
+        };
+        let result = LogsSubscriptionHandler::parse_subscription(&request);
+        assert!(result.is_ok());
+        let (subscription, metadata) = result.unwrap();
+        assert_eq!(subscription, Subscription {});
+        assert_eq!(
+            metadata,
+            Metadata {
+                is_all: false,
+                is_all_with_votes: true,
+                sorted_mentions: Vec::new(),
+                commitment: Commitment::Finalized,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_subscription_with_all_with_mentions() {
+        let request = jsonrpc::Request {
+            jsonrpc: "2.0".to_string(),
+            method: "accountSubscribe".to_string(),
+            id: 42,
+            params: Some(serde_json::json!([
+                {"mentions": ["ccc"]},
+                {"mentions": ["aaa"]},
+                {"mentions": ["bbb"]},
+            ])),
+        };
+        let result = LogsSubscriptionHandler::parse_subscription(&request);
+        assert!(result.is_ok());
+        let (subscription, metadata) = result.unwrap();
+        assert_eq!(subscription, Subscription {});
+        assert_eq!(
+            metadata,
+            Metadata {
+                is_all: false,
+                is_all_with_votes: false,
+                sorted_mentions: vec!["aaa".to_string(), "bbb".to_string(), "ccc".to_string(),],
+                commitment: Commitment::Finalized,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_subscription_with_all_with_commitment() {
+        let request = jsonrpc::Request {
+            jsonrpc: "2.0".to_string(),
+            method: "accountSubscribe".to_string(),
+            id: 42,
+            params: Some(serde_json::json!([
+                {"commitment": "processed"},
+            ])),
+        };
+        let result = LogsSubscriptionHandler::parse_subscription(&request);
+        assert!(result.is_ok());
+        let (subscription, metadata) = result.unwrap();
+        assert_eq!(subscription, Subscription {});
+        assert_eq!(
+            metadata,
+            Metadata {
+                is_all: false,
+                is_all_with_votes: false,
+                sorted_mentions: Vec::new(),
+                commitment: Commitment::Processed,
+            }
+        );
     }
 }

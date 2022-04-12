@@ -58,16 +58,6 @@ impl SubscriptionHandler<Subscription, Metadata> for SlotSubscriptionHandler {
         Ok((Subscription {}, Metadata {}))
     }
 
-    fn format_notification(
-        notification: &jsonrpc::Notification,
-        _subscription: &Subscription,
-        _state: &mut Option<FormatState>,
-    ) -> Result<String, String> {
-        let result = serde_json::to_string(notification)
-            .map_err(|e| format!("serialization error: {}", e))?;
-        Ok(result)
-    }
-
     fn poll_method() -> &'static str {
         ""
     }

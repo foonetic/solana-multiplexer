@@ -55,16 +55,6 @@ pub trait SubscriptionHandler<Subscription: Eq + Hash + Clone, Metadata: Eq + Ha
     /// Metadata.
     fn parse_subscription(request: &jsonrpc::Request) -> Result<(Subscription, Metadata), String>;
 
-    /// Returns raw JSONRPC notification data, formatted with the Subscription
-    /// parameters. The state is shared across calls for a given notification.
-    /// For example, the state will be passed in for every different encoding
-    /// that a notification must be formatted to.
-    fn format_notification(
-        notification: &jsonrpc::Notification,
-        subscription: &Subscription,
-        state: &mut Option<Self::FormatState>,
-    ) -> Result<String, String>;
-
     /// Returns a notion of timestamp for an input notification. Notifications
     /// that are missing timestamps will be dropped. Only the most recent
     /// notifications will be sent to clients. This function defaults to returning
@@ -336,6 +326,20 @@ pub trait SubscriptionHandler<Subscription: Eq + Hash + Clone, Metadata: Eq + Ha
                 self.tracker_mut().remove_client(client);
             }
         }
+    }
+
+    /// Returns raw JSONRPC notification data, formatted with the Subscription
+    /// parameters. The state is shared across calls for a given notification.
+    /// For example, the state will be passed in for every different encoding
+    /// that a notification must be formatted to.
+    fn format_notification(
+        notification: &jsonrpc::Notification,
+        _subscription: &Subscription,
+        _state: &mut Option<Self::FormatState>,
+    ) -> Result<String, String> {
+        let result = serde_json::to_string(notification)
+            .map_err(|e| format!("serialization error: {}", e))?;
+        Ok(result)
     }
 }
 

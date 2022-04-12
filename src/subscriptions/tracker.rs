@@ -119,6 +119,10 @@ impl<S: Eq + Hash, M: Eq + Hash + Clone> SubscriptionTracker<S, M> {
         timestamp: u64,
         payload: Option<String>,
     ) -> bool {
+        if !self.subscription_to_clients.contains_key(subscription) {
+            return false;
+        }
+
         let latest = self.last_payload_seen.entry(subscription.clone());
         match latest {
             // Never seen data for this subscription before, so return.
@@ -256,5 +260,295 @@ impl<S: Eq + Hash, M: Eq + Hash + Clone> SubscriptionTracker<S, M> {
         }
         self.client_to_subscriptions.remove(client);
         to_unsubscribe
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn track_new_subscription() {
+        let mut tracker = SubscriptionTracker::<String, u64>::new();
+        let mut next_subscription = ServerInstructionID(0);
+        let (subscription, is_new) = tracker.track_subscription(
+            &ClientID(0),
+            &mut next_subscription,
+            Some("hello".to_string()),
+            123,
+        );
+
+        assert_eq!(subscription, ServerInstructionID(0));
+        assert!(is_new);
+        assert!(tracker
+            .get_notification_subscribers(&ServerInstructionID(0))
+            .unwrap()
+            .contains(&Subscription::<String> {
+                client: ClientID(0),
+                subscription: Some("hello".to_string()),
+            }));
+    }
+
+    #[test]
+    fn track_new_subscription_old_metadata() {
+        let mut tracker = SubscriptionTracker::<String, u64>::new();
+        let mut next_subscription = ServerInstructionID(0);
+        let (subscription, is_new) = tracker.track_subscription(
+            &ClientID(0),
+            &mut next_subscription,
+            Some("hello".to_string()),
+            123,
+        );
+        assert_eq!(subscription, ServerInstructionID(0));
+        assert!(is_new);
+        assert!(tracker
+            .get_notification_subscribers(&ServerInstructionID(0))
+            .unwrap()
+            .contains(&Subscription::<String> {
+                client: ClientID(0),
+                subscription: Some("hello".to_string()),
+            }));
+
+        let (subscription, is_new) = tracker.track_subscription(
+            &ClientID(1),
+            &mut next_subscription,
+            Some("world".to_string()),
+            123,
+        );
+        assert_eq!(subscription, ServerInstructionID(0));
+        assert!(!is_new);
+        assert!(tracker
+            .get_notification_subscribers(&ServerInstructionID(0))
+            .unwrap()
+            .contains(&Subscription::<String> {
+                client: ClientID(1),
+                subscription: Some("world".to_string()),
+            }));
+    }
+
+    #[test]
+    fn track_new_subscription_new_metadata() {
+        let mut tracker = SubscriptionTracker::<String, u64>::new();
+        let mut next_subscription = ServerInstructionID(0);
+        let (subscription, is_new) = tracker.track_subscription(
+            &ClientID(0),
+            &mut next_subscription,
+            Some("hello".to_string()),
+            123,
+        );
+        assert_eq!(subscription, ServerInstructionID(0));
+        assert!(is_new);
+        assert!(tracker
+            .get_notification_subscribers(&ServerInstructionID(0))
+            .unwrap()
+            .contains(&Subscription::<String> {
+                client: ClientID(0),
+                subscription: Some("hello".to_string()),
+            }));
+
+        let (subscription, is_new) = tracker.track_subscription(
+            &ClientID(1),
+            &mut next_subscription,
+            Some("hello".to_string()),
+            456,
+        );
+        assert_eq!(subscription, ServerInstructionID(1));
+        assert!(is_new);
+        assert!(tracker
+            .get_notification_subscribers(&ServerInstructionID(1))
+            .unwrap()
+            .contains(&Subscription::<String> {
+                client: ClientID(1),
+                subscription: Some("hello".to_string()),
+            }));
+    }
+
+    #[test]
+    fn untracked_subscription_should_not_broadcast() {
+        let mut tracker = SubscriptionTracker::<String, u64>::new();
+        assert!(!tracker.notification_should_broadcast(&ServerInstructionID(0), 100, None));
+    }
+
+    #[test]
+    fn subscription_should_broadcast_based_on_timestamp_order() {
+        let mut tracker = SubscriptionTracker::<String, u64>::new();
+        let mut next_subscription = ServerInstructionID(0);
+        let (subscription, is_new) = tracker.track_subscription(
+            &ClientID(0),
+            &mut next_subscription,
+            Some("hello".to_string()),
+            123,
+        );
+        assert_eq!(subscription, ServerInstructionID(0));
+        assert!(is_new);
+        assert!(tracker
+            .get_notification_subscribers(&ServerInstructionID(0))
+            .unwrap()
+            .contains(&Subscription::<String> {
+                client: ClientID(0),
+                subscription: Some("hello".to_string()),
+            }));
+        assert!(tracker.notification_should_broadcast(&ServerInstructionID(0), 100, None));
+        assert!(!tracker.notification_should_broadcast(&ServerInstructionID(0), 100, None));
+        assert!(!tracker.notification_should_broadcast(&ServerInstructionID(0), 99, None));
+        assert!(tracker.notification_should_broadcast(&ServerInstructionID(0), 101, None));
+        assert!(!tracker.notification_should_broadcast(&ServerInstructionID(0), 101, None));
+        assert!(!tracker.notification_should_broadcast(&ServerInstructionID(0), 100, None));
+    }
+
+    #[test]
+    fn subscription_should_broadcast_based_on_stale_data() {
+        let mut tracker = SubscriptionTracker::<String, u64>::new();
+        let mut next_subscription = ServerInstructionID(0);
+        let (subscription, is_new) = tracker.track_subscription(
+            &ClientID(0),
+            &mut next_subscription,
+            Some("hello".to_string()),
+            123,
+        );
+        assert_eq!(subscription, ServerInstructionID(0));
+        assert!(is_new);
+        assert!(tracker
+            .get_notification_subscribers(&ServerInstructionID(0))
+            .unwrap()
+            .contains(&Subscription::<String> {
+                client: ClientID(0),
+                subscription: Some("hello".to_string()),
+            }));
+        assert!(tracker.notification_should_broadcast(&ServerInstructionID(0), 100, None));
+        assert!(tracker.notification_should_broadcast(
+            &ServerInstructionID(0),
+            101,
+            Some("a".to_string())
+        ));
+        assert!(!tracker.notification_should_broadcast(
+            &ServerInstructionID(0),
+            102,
+            Some("a".to_string())
+        ));
+        assert!(tracker.notification_should_broadcast(
+            &ServerInstructionID(0),
+            103,
+            Some("b".to_string())
+        ));
+        assert!(tracker.notification_should_broadcast(&ServerInstructionID(0), 104, None));
+        assert!(tracker.notification_should_broadcast(&ServerInstructionID(0), 105, None));
+    }
+
+    #[test]
+    fn remove_subscription() {
+        let mut tracker = SubscriptionTracker::<String, u64>::new();
+        let mut next_subscription = ServerInstructionID(0);
+
+        tracker.track_subscription(
+            &ClientID(0),
+            &mut next_subscription,
+            Some("hello".to_string()),
+            123,
+        );
+        tracker.track_subscription(
+            &ClientID(0),
+            &mut next_subscription,
+            Some("world".to_string()),
+            456,
+        );
+        tracker.track_subscription(
+            &ClientID(1),
+            &mut next_subscription,
+            Some("hello".to_string()),
+            123,
+        );
+        tracker.track_subscription(
+            &ClientID(1),
+            &mut next_subscription,
+            Some("world".to_string()),
+            456,
+        );
+
+        assert!(tracker
+            .get_notification_subscribers(&ServerInstructionID(0))
+            .unwrap()
+            .contains(&Subscription::<String> {
+                client: ClientID(0),
+                subscription: Some("hello".to_string()),
+            }));
+        assert!(tracker
+            .get_notification_subscribers(&ServerInstructionID(0))
+            .unwrap()
+            .contains(&Subscription::<String> {
+                client: ClientID(1),
+                subscription: Some("hello".to_string()),
+            }));
+
+        assert!(tracker
+            .get_notification_subscribers(&ServerInstructionID(1))
+            .unwrap()
+            .contains(&Subscription::<String> {
+                client: ClientID(0),
+                subscription: Some("world".to_string()),
+            }));
+        assert!(tracker
+            .get_notification_subscribers(&ServerInstructionID(1))
+            .unwrap()
+            .contains(&Subscription::<String> {
+                client: ClientID(1),
+                subscription: Some("world".to_string()),
+            }));
+
+        tracker.remove_single_subscription(&ClientID(0), &ServerInstructionID(0));
+
+        assert!(!tracker
+            .get_notification_subscribers(&ServerInstructionID(0))
+            .unwrap()
+            .contains(&Subscription::<String> {
+                client: ClientID(0),
+                subscription: Some("hello".to_string()),
+            }));
+        assert!(tracker
+            .get_notification_subscribers(&ServerInstructionID(0))
+            .unwrap()
+            .contains(&Subscription::<String> {
+                client: ClientID(1),
+                subscription: Some("hello".to_string()),
+            }));
+
+        assert!(tracker
+            .get_notification_subscribers(&ServerInstructionID(1))
+            .unwrap()
+            .contains(&Subscription::<String> {
+                client: ClientID(0),
+                subscription: Some("world".to_string()),
+            }));
+        assert!(tracker
+            .get_notification_subscribers(&ServerInstructionID(1))
+            .unwrap()
+            .contains(&Subscription::<String> {
+                client: ClientID(1),
+                subscription: Some("world".to_string()),
+            }));
+
+        let to_unsubscribe = tracker.remove_client(&ClientID(1));
+
+        assert!(tracker
+            .get_notification_subscribers(&ServerInstructionID(0))
+            .is_none());
+
+        assert!(tracker
+            .get_notification_subscribers(&ServerInstructionID(1))
+            .unwrap()
+            .contains(&Subscription::<String> {
+                client: ClientID(0),
+                subscription: Some("world".to_string()),
+            }));
+        assert!(!tracker
+            .get_notification_subscribers(&ServerInstructionID(1))
+            .unwrap()
+            .contains(&Subscription::<String> {
+                client: ClientID(1),
+                subscription: Some("world".to_string()),
+            }));
+
+        assert_eq!(to_unsubscribe.len(), 1);
+        assert_eq!(ServerInstructionID(0), *to_unsubscribe.get(0).unwrap());
     }
 }

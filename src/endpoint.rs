@@ -1,4 +1,4 @@
-use crate::{channel_types::*, jsonrpc};
+use crate::{channel_types::*, jsonrpc, metrics};
 use futures_util::{stream::SplitStream, SinkExt, StreamExt};
 use std::{
     collections::{hash_map::Entry, HashMap},
@@ -36,6 +36,7 @@ struct EndpointSubscriberID(i64);
 
 /// Represents a PubSub endpont.
 pub struct PubsubEndpoint {
+    url: Url,
     reader: SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>,
     enqueue: UnboundedSender<Message>,
     send_to_server: UnboundedSender<EndpointToServer>,
@@ -46,6 +47,7 @@ pub struct PubsubEndpoint {
 
 impl PubsubEndpoint {
     pub fn new(
+        url: Url,
         ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
         send_to_server: UnboundedSender<EndpointToServer>,
         receive_from_server: UnboundedReceiver<ServerToPubsub>,
@@ -63,6 +65,7 @@ impl PubsubEndpoint {
         });
 
         Self {
+            url,
             reader,
             enqueue,
             send_to_server,
@@ -108,12 +111,21 @@ impl PubsubEndpoint {
             Message::Binary(msg) => self.on_binary_message(msg),
             Message::Ping(_msg) => {
                 // No need to send a reply: tungstenite takes care of this for you.
+                metrics::PUBSUB_MESSAGE_COUNT
+                    .with_label_values(&[self.url.as_str(), "ping"])
+                    .inc();
             }
             Message::Pong(_msg) => {
                 // Ignore: assume all pongs are valid.
+                metrics::PUBSUB_MESSAGE_COUNT
+                    .with_label_values(&[self.url.as_str(), "pong"])
+                    .inc();
             }
             Message::Close(_msg) => {
                 // No need to send reply; this is handled by the library.
+                metrics::PUBSUB_MESSAGE_COUNT
+                    .with_label_values(&[self.url.as_str(), "close"])
+                    .inc();
             }
             Message::Frame(_msg) => {
                 unreachable!();
@@ -125,6 +137,10 @@ impl PubsubEndpoint {
     fn on_text_message(&mut self, message: String) {
         if let Ok(reply) = serde_json::from_str(&message) {
             self.on_json(reply);
+        } else {
+            metrics::PUBSUB_MESSAGE_COUNT
+                .with_label_values(&[self.url.as_str(), "unknown_text"])
+                .inc();
         }
     }
 
@@ -132,6 +148,10 @@ impl PubsubEndpoint {
     fn on_binary_message(&mut self, message: Vec<u8>) {
         if let Ok(reply) = serde_json::from_slice(&message) {
             self.on_json(reply);
+        } else {
+            metrics::PUBSUB_MESSAGE_COUNT
+                .with_label_values(&[self.url.as_str(), "unknown_binary"])
+                .inc();
         }
     }
 
@@ -139,30 +159,47 @@ impl PubsubEndpoint {
     fn on_json(&mut self, value: serde_json::Value) {
         if let Ok(mut notification) = serde_json::from_value::<jsonrpc::Notification>(value.clone())
         {
+            metrics::PUBSUB_MESSAGE_COUNT
+                .with_label_values(&[self.url.as_str(), "notification"])
+                .inc();
+
             if let Some(id) = self
                 .local_to_global_subscriber
                 .get(&EndpointSubscriberID(notification.params.subscription))
             {
                 notification.params.subscription = id.0;
-                if let Err(err) = self
-                    .send_to_server
-                    .send(EndpointToServer::Notification(notification))
-                {
+                if let Err(err) = self.send_to_server.send(EndpointToServer::Notification(
+                    notification,
+                    self.url.clone(),
+                )) {
                     error!(
                         "unable to enqueue notification from pubsub endpoint: {}",
                         err
                     );
                 }
+            } else {
+                metrics::PUBSUB_MESSAGE_COUNT
+                    .with_label_values(&[self.url.as_str(), "unknown_notification"])
+                    .inc();
             }
         } else if let Ok(reply) =
             serde_json::from_value::<jsonrpc::SubscribeResponse>(value.clone())
         {
+            metrics::PUBSUB_MESSAGE_COUNT
+                .with_label_values(&[self.url.as_str(), "subscribe"])
+                .inc();
             self.on_subscribe_reply(reply);
         } else if let Ok(reply) =
             serde_json::from_value::<jsonrpc::UnsubscribeResponse>(value.clone())
         {
+            metrics::PUBSUB_MESSAGE_COUNT
+                .with_label_values(&[self.url.as_str(), "unsubscribe"])
+                .inc();
             info!("unsubscribe confirmed for request {}", reply.id);
         } else {
+            metrics::PUBSUB_MESSAGE_COUNT
+                .with_label_values(&[self.url.as_str(), "unknown"])
+                .inc();
             info!("unhandled reply: {:?}", value);
         }
     }
@@ -296,7 +333,10 @@ impl HTTPPoll {
                         },
                     };
                     // Let the query fail since we will retry momentarily.
-                    if let Err(err) = self.send.send(EndpointToServer::Notification(notification)) {
+                    if let Err(err) = self.send.send(EndpointToServer::Notification(
+                        notification,
+                        self.url.clone(),
+                    )) {
                         error!(
                             "http endpoint {} failed to poll: {}",
                             self.url.as_str(),

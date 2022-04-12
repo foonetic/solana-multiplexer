@@ -36,11 +36,35 @@ the multiplexer and forwarded to each subscribed client.
 The following invocation arbitrates among two websocket endpoints and two http
 endpoints. The arbitrated websocket endpoint is served at `0.0.0.0:8900`. HTTP
 endpoints are polled every 200 milliseconds.
-```
+```bash
 multiplexer --endpoint wss://api.mainnet-beta.solana.com:443   \
             --endpoint https://api.mainnet-beta.solana.com:443 \
             --endpoint wss://solana-api.projectserum.com:443   \
             --endpoint https://solana-api.projectserum.com:443 \
             --listen_address 0.0.0.0:8900                      \
             --poll_frequency_milliseconds 200
+```
+
+## Metrics
+
+The multiplexer publishes Prometheus metrics on the same address as the API
+endpoint at path `/metrics`. For example:
+
+```bash
+$ curl localhost:8900/metrics
+# HELP client_request_count number of client requests received
+# TYPE client_request_count counter
+client_request_count 15
+# HELP latest_slot_seen Latest slot number seen across endpoints
+# TYPE latest_slot_seen gauge
+latest_slot_seen{endpoint="wss://api.devnet.solana.com/"} 127640127
+# HELP metrics_serve_count number of times metrics have been served
+# TYPE metrics_serve_count counter
+metrics_serve_count 11
+# HELP pubsub_message_count PubSub message count
+# TYPE pubsub_message_count counter
+pubsub_message_count{endpoint="wss://api.devnet.solana.com/",type="notification"} 44056
+pubsub_message_count{endpoint="wss://api.devnet.solana.com/",type="pong"} 7
+pubsub_message_count{endpoint="wss://api.devnet.solana.com/",type="subscribe"} 12
+pubsub_message_count{endpoint="wss://api.devnet.solana.com/",type="unsubscribe"} 12
 ```

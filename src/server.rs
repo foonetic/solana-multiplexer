@@ -2,14 +2,17 @@ use crate::{
     channel_types::*,
     client::ClientHandler,
     endpoint::{self, EndpointConfig},
-    jsonrpc,
+    jsonrpc, metrics,
     subscriptions::{
         AccountSubscriptionHandler, LogsSubscriptionHandler, ProgramSubscriptionHandler,
         RootSubscriptionHandler, SignatureSubscriptionHandler, SlotSubscriptionHandler,
         SubscriptionHandler,
     },
 };
-use hyper::service::{make_service_fn, service_fn};
+use hyper::{
+    service::{make_service_fn, service_fn},
+    Response, StatusCode,
+};
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tracing::{error, info};
@@ -98,12 +101,27 @@ impl Server {
 
             async move {
                 // Called once per request.
+                let send_to_server = send_to_server.clone();
 
                 Ok::<_, hyper::Error>(service_fn(move |request| {
-                    let mut client_handler = ClientHandler::new(send_to_server.clone());
+                    metrics::CLIENT_REQUEST_COUNT.inc();
 
                     // Returns the future that should be executed to get a response.
-                    async move { client_handler.run(request).await }
+                    let client_handler = if request.uri().path() == "/metrics" {
+                        None
+                    } else {
+                        Some(ClientHandler::new(send_to_server.clone()))
+                    };
+                    async move {
+                        match request.uri().path() {
+                            "/metrics" => metrics::serve_metrics(),
+                            "/" => client_handler.unwrap().run(request).await,
+                            _ => Response::builder()
+                                .status(StatusCode::NOT_FOUND)
+                                .body(hyper::Body::empty())
+                                .map_err(|e| e.into()),
+                        }
+                    }
                 }))
             }
         });
@@ -142,6 +160,7 @@ impl Server {
                     info!("connecting to Pubsub endpoint {}", url.as_str());
                     let (ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
                     let mut pubsub_endpoint = endpoint::PubsubEndpoint::new(
+                        url.clone(),
                         ws,
                         self.endpoint_to_server.clone(),
                         receive_from_server,
@@ -220,36 +239,78 @@ impl Server {
     /// Processes an endpoint message.
     fn on_endpoint_message(&mut self, message: EndpointToServer) {
         match message {
-            EndpointToServer::Notification(notification) => {
-                self.process_notification(notification);
+            EndpointToServer::Notification(notification, url) => {
+                self.process_notification(notification, url);
             }
         }
     }
 
     /// Processes an endpoint message that was determined to be a notification.
-    fn process_notification(&mut self, notification: jsonrpc::Notification) {
+    fn process_notification(&mut self, notification: jsonrpc::Notification, source: url::Url) {
         match notification.method.as_str() {
             "accountNotification" => {
+                if let Some(slot) =
+                    AccountSubscriptionHandler::get_notification_timestamp(&notification)
+                {
+                    metrics::LATEST_SLOT_SEEN
+                        .with_label_values(&[source.as_str()])
+                        .set(slot as i64);
+                }
                 self.account_subscriptions
                     .broadcast(notification, &self.send_to_client);
             }
             "logsNotification" => {
+                if let Some(slot) =
+                    LogsSubscriptionHandler::get_notification_timestamp(&notification)
+                {
+                    metrics::LATEST_SLOT_SEEN
+                        .with_label_values(&[source.as_str()])
+                        .set(slot as i64);
+                }
                 self.logs_subscriptions
                     .broadcast(notification, &self.send_to_client);
             }
             "programNotification" => {
+                if let Some(slot) =
+                    ProgramSubscriptionHandler::get_notification_timestamp(&notification)
+                {
+                    metrics::LATEST_SLOT_SEEN
+                        .with_label_values(&[source.as_str()])
+                        .set(slot as i64);
+                }
                 self.program_subscriptions
                     .broadcast(notification, &self.send_to_client);
             }
             "signatureNotification" => {
+                if let Some(slot) =
+                    SignatureSubscriptionHandler::get_notification_timestamp(&notification)
+                {
+                    metrics::LATEST_SLOT_SEEN
+                        .with_label_values(&[source.as_str()])
+                        .set(slot as i64);
+                }
                 self.signature_subscriptions
                     .broadcast_and_unsubscribe(notification, &self.send_to_client);
             }
             "slotNotification" => {
+                if let Some(slot) =
+                    SlotSubscriptionHandler::get_notification_timestamp(&notification)
+                {
+                    metrics::LATEST_SLOT_SEEN
+                        .with_label_values(&[source.as_str()])
+                        .set(slot as i64);
+                }
                 self.slot_subscriptions
                     .broadcast(notification, &self.send_to_client);
             }
             "rootNotification" => {
+                if let Some(slot) =
+                    RootSubscriptionHandler::get_notification_timestamp(&notification)
+                {
+                    metrics::LATEST_SLOT_SEEN
+                        .with_label_values(&[source.as_str()])
+                        .set(slot as i64);
+                }
                 self.root_subscriptions
                     .broadcast(notification, &self.send_to_client);
             }

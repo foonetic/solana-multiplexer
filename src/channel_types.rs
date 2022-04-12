@@ -152,5 +152,5 @@ pub enum ServerToPubsub {
 #[derive(Debug)]
 pub enum EndpointToServer {
     /// Raw notification response.
-    Notification(jsonrpc::Notification),
+    Notification(jsonrpc::Notification, url::Url),
 }

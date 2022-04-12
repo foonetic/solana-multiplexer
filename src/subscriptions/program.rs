@@ -167,6 +167,12 @@ impl SubscriptionHandler<Subscription, Metadata> for ProgramSubscriptionHandler 
             }
         }
 
+        metadata.data_size.sort_unstable();
+        metadata.data_size.dedup();
+
+        metadata.memcmp.sort_unstable();
+        metadata.memcmp.dedup();
+
         Ok((subscription, metadata))
     }
 
@@ -227,12 +233,423 @@ impl SubscriptionHandler<Subscription, Metadata> for ProgramSubscriptionHandler 
         let result =
             serde_json::to_string(&result).map_err(|e| format!("serialization error: {}", e))?;
         Ok(format!(
-            r#"{{"jsonrpc":"2.0","method":"accountNotification","params":{{"subscription":{},"result":{}}}}}"#,
+            r#"{{"jsonrpc":"2.0","method":"programNotification","params":{{"subscription":{},"result":{}}}}}"#,
             notification.params.subscription, result
         ))
     }
 
     fn poll_method() -> &'static str {
         ""
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{from_str, json, Value};
+
+    #[test]
+    fn format_pubsub_subscribe() {
+        let metadata = Metadata {
+            pubkey: String::from("hear ye hear ye"),
+            commitment: Commitment::Confirmed,
+            data_size: vec![3, 1, 2],
+            memcmp: vec![
+                MemCmp {
+                    offset: 3,
+                    bytes: "abc".to_string(),
+                },
+                MemCmp {
+                    offset: 1,
+                    bytes: "def".to_string(),
+                },
+                MemCmp {
+                    offset: 2,
+                    bytes: "ghi".to_string(),
+                },
+            ],
+        };
+        let id = ServerInstructionID(42);
+
+        let got = ProgramSubscriptionHandler::format_pubsub_subscribe(&id, &metadata);
+        assert_eq!(
+            from_str::<Value>(&got).unwrap(),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 42,
+                "method": "programSubscribe",
+                "params": [
+                    "hear ye hear ye",
+                    {
+                        "encoding": "base64",
+                        "commitment": "confirmed",
+                        "filters": [
+                            {"dataSize": 3},
+                            {"dataSize": 1},
+                            {"dataSize": 2},
+                            {"memcmp": {"offset": 3, "bytes": "abc"}},
+                            {"memcmp": {"offset": 1, "bytes": "def"}},
+                            {"memcmp": {"offset": 2, "bytes": "ghi"}},
+                        ]
+                    },
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn parse_subscription_fails_without_params() {
+        let request = jsonrpc::Request {
+            jsonrpc: "2.0".to_string(),
+            method: "programSubscribe".to_string(),
+            id: 42,
+            params: None,
+        };
+        let result = ProgramSubscriptionHandler::parse_subscription(&request);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_subscription_fails_with_non_array_params() {
+        let request = jsonrpc::Request {
+            jsonrpc: "2.0".to_string(),
+            method: "programSubscribe".to_string(),
+            id: 42,
+            params: Some(serde_json::Value::String("what's up?".to_string())),
+        };
+        let result = ProgramSubscriptionHandler::parse_subscription(&request);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_subscription_fails_with_missing_pubkey() {
+        let request = jsonrpc::Request {
+            jsonrpc: "2.0".to_string(),
+            method: "programSubscribe".to_string(),
+            id: 42,
+            params: Some(serde_json::Value::Array(vec![])),
+        };
+        let result = ProgramSubscriptionHandler::parse_subscription(&request);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_subscription_fails_with_non_string_pubkey() {
+        let request = jsonrpc::Request {
+            jsonrpc: "2.0".to_string(),
+            method: "accountSubscribe".to_string(),
+            id: 42,
+            params: Some(serde_json::Value::Array(vec![serde_json::Value::Bool(
+                true,
+            )])),
+        };
+        let result = ProgramSubscriptionHandler::parse_subscription(&request);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_subscription_with_pubkey() {
+        let request = jsonrpc::Request {
+            jsonrpc: "2.0".to_string(),
+            method: "programSubscribe".to_string(),
+            id: 42,
+            params: Some(serde_json::json!(["hello world"])),
+        };
+        let result = ProgramSubscriptionHandler::parse_subscription(&request);
+        assert!(result.is_ok());
+        let (subscription, metadata) = result.unwrap();
+        assert_eq!(
+            subscription,
+            Subscription {
+                encoding: Encoding::Base64,
+            }
+        );
+        assert_eq!(
+            metadata,
+            Metadata {
+                pubkey: "hello world".to_string(),
+                commitment: Commitment::Finalized,
+                data_size: vec![],
+                memcmp: vec![],
+            }
+        );
+    }
+
+    #[test]
+    fn parse_subscription_with_params() {
+        let request = jsonrpc::Request {
+            jsonrpc: "2.0".to_string(),
+            method: "programSubscribe".to_string(),
+            id: 42,
+            params: Some(serde_json::json!([
+                "hear ye hear ye",
+                {
+                    "encoding": "base64",
+                    "commitment": "confirmed",
+                    "filters": [
+                        {"dataSize": 3},
+                        {"dataSize": 1},
+                        {"dataSize": 2},
+                        {"memcmp": {"offset": 3, "bytes": "abc"}},
+                        {"memcmp": {"offset": 1, "bytes": "def"}},
+                        {"memcmp": {"offset": 2, "bytes": "ghi"}},
+                    ]
+                },
+            ])),
+        };
+        let result = ProgramSubscriptionHandler::parse_subscription(&request);
+        assert!(result.is_ok());
+        let (subscription, metadata) = result.unwrap();
+        assert_eq!(
+            subscription,
+            Subscription {
+                encoding: Encoding::Base64,
+            }
+        );
+        assert_eq!(
+            metadata,
+            Metadata {
+                pubkey: "hear ye hear ye".to_string(),
+                commitment: Commitment::Confirmed,
+                data_size: vec![1, 2, 3],
+                memcmp: vec![
+                    MemCmp {
+                        offset: 1,
+                        bytes: "def".to_string(),
+                    },
+                    MemCmp {
+                        offset: 2,
+                        bytes: "ghi".to_string(),
+                    },
+                    MemCmp {
+                        offset: 3,
+                        bytes: "abc".to_string(),
+                    }
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn format_notification_without_state() {
+        let mut state = None;
+        let notification = jsonrpc::Notification {
+            jsonrpc: "2.0".to_string(),
+            method: "programNotification".to_string(),
+            params: jsonrpc::NotificationParams {
+                subscription: 42,
+                result: json!({
+                    "context": {
+                        "slot": 1234,
+                    },
+                    "value": {
+                        "pubkey": "what is love",
+                        "account": {
+                            "data": [
+                                base64::encode(b"google en passant"),
+                                "base64",
+                            ],
+                            "executable": false,
+                            "lamports": 987,
+                            "owner": "blair_witch",
+                            "rentEpoch": 999,
+                        }
+                    }
+                }),
+            },
+        };
+
+        let subscription = Subscription {
+            encoding: Encoding::Base64,
+        };
+
+        let result = ProgramSubscriptionHandler::format_notification(
+            &notification,
+            &subscription,
+            &mut state,
+        );
+        assert!(state.is_none());
+        assert!(result.is_ok());
+        let result = result.unwrap();
+        let result = from_str::<Value>(&result).unwrap();
+
+        assert_eq!(
+            result,
+            json!({
+                "jsonrpc": "2.0",
+                "method": "programNotification",
+                "params": {
+                    "subscription": 42,
+                    "result": {
+                        "context": {
+                            "slot": 1234,
+                        },
+                        "value": {
+                            "pubkey": "what is love",
+                            "account": {
+                                "data": [
+                                    base64::encode(b"google en passant"),
+                                    "base64",
+                                ],
+                                "executable": false,
+                                "lamports": 987,
+                                "owner": "blair_witch",
+                                "rentEpoch": 999,
+                            }
+                        }
+                    }
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn format_notification_base58() {
+        let mut state = None;
+        let notification = jsonrpc::Notification {
+            jsonrpc: "2.0".to_string(),
+            method: "programNotification".to_string(),
+            params: jsonrpc::NotificationParams {
+                subscription: 42,
+                result: json!({
+                    "context": {
+                        "slot": 1234,
+                    },
+                    "value": {
+                        "pubkey": "what is love",
+                        "account": {
+                            "data": [
+                                base64::encode(b"google en passant"),
+                                "base64",
+                            ],
+                            "executable": false,
+                            "lamports": 987,
+                            "owner": "blair_witch",
+                            "rentEpoch": 999,
+                        }
+                    }
+                }),
+            },
+        };
+
+        let subscription = Subscription {
+            encoding: Encoding::Base58,
+        };
+
+        let result = ProgramSubscriptionHandler::format_notification(
+            &notification,
+            &subscription,
+            &mut state,
+        );
+        assert!(state.is_some());
+        assert!(result.is_ok());
+        let result = result.unwrap();
+        let result = from_str::<Value>(&result).unwrap();
+
+        assert_eq!(
+            result,
+            json!({
+                "jsonrpc": "2.0",
+                "method": "programNotification",
+                "params": {
+                    "subscription": 42,
+                    "result": {
+                        "context": {
+                            "slot": 1234,
+                        },
+                        "value": {
+                            "pubkey": "what is love",
+                            "account": {
+                                "data": [
+                                    bs58::encode(b"google en passant").into_string(),
+                                    "base58",
+                                ],
+                                "executable": false,
+                                "lamports": 987,
+                                "owner": "blair_witch",
+                                "rentEpoch": 999,
+                            }
+                        }
+                    }
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn format_notification_base64_zstd() {
+        let mut state = None;
+        let notification = jsonrpc::Notification {
+            jsonrpc: "2.0".to_string(),
+            method: "programNotification".to_string(),
+            params: jsonrpc::NotificationParams {
+                subscription: 42,
+                result: json!({
+                    "context": {
+                        "slot": 1234,
+                    },
+                    "value": {
+                        "pubkey": "what is love",
+                        "account": {
+                            "data": [
+                                base64::encode(b"google en passant"),
+                                "base64",
+                            ],
+                            "executable": false,
+                            "lamports": 987,
+                            "owner": "blair_witch",
+                            "rentEpoch": 999,
+                        }
+                    }
+                }),
+            },
+        };
+
+        let subscription = Subscription {
+            encoding: Encoding::Base64Zstd,
+        };
+
+        let result = ProgramSubscriptionHandler::format_notification(
+            &notification,
+            &subscription,
+            &mut state,
+        );
+        assert!(state.is_some());
+        assert!(result.is_ok());
+        let result = result.unwrap();
+        let result = from_str::<Value>(&result).unwrap();
+
+        assert_eq!(
+            result,
+            json!({
+                "jsonrpc": "2.0",
+                "method": "programNotification",
+                "params": {
+                    "subscription": 42,
+                    "result": {
+                        "context": {
+                            "slot": 1234,
+                        },
+                        "value": {
+                            "pubkey": "what is love",
+                            "account": {
+                                "data": [
+                                    base64::encode(zstd::encode_all(b"google en passant".as_slice(), 0).unwrap()),
+                                    "base64+zstd",
+                                ],
+                                "executable": false,
+                                "lamports": 987,
+                                "owner": "blair_witch",
+                                "rentEpoch": 999,
+                            }
+                        }
+                    }
+                }
+            })
+        );
     }
 }

@@ -432,15 +432,15 @@ mod tests {
     use super::*;
     use serde_json::{from_str, json, Value};
 
-    type DummySubscription = u8;
-    type DummyMetadata = u16;
+    type DummySubscription = u16;
+    type DummyMetadata = u32;
 
     struct DummyHandler {
         tracker: SubscriptionTracker<DummySubscription, DummyMetadata>,
     }
 
     impl SubscriptionHandler<DummySubscription, DummyMetadata> for DummyHandler {
-        type FormatState = u32;
+        type FormatState = u64;
 
         fn tracker_mut(&mut self) -> &mut SubscriptionTracker<DummySubscription, DummyMetadata> {
             &mut self.tracker
@@ -470,6 +470,7 @@ mod tests {
             format!("pubsub {} {}", id.0, metadata)
         }
 
+        /// The params are [subscription, metadata].
         fn parse_subscription(
             request: &jsonrpc::Request,
         ) -> Result<(DummySubscription, DummyMetadata), String> {
@@ -493,10 +494,18 @@ mod tests {
             subscription: &DummySubscription,
             state: &mut Option<Self::FormatState>,
         ) -> Result<String, String> {
-            if let serde_json::Value::Number(result) = &notification.params.result {
-                let num = result.as_f64().unwrap();
-                *state = Some(num as Self::FormatState);
-                Ok((num as u64 + *subscription as u64).to_string())
+            if let serde_json::Value::Object(result) = &notification.params.result {
+                if let Some(serde_json::Value::Number(result)) = result.get("number") {
+                    let num = result.as_f64().unwrap();
+                    if state.is_none() {
+                        *state = Some(0);
+                    } else {
+                        *state = Some(state.unwrap() + 1);
+                    }
+                    Ok((num as u64 + *subscription as u64).to_string())
+                } else {
+                    Err("error".to_string())
+                }
             } else {
                 Err("error".to_string())
             }
@@ -655,6 +664,572 @@ mod tests {
             } else {
                 panic!();
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn subscribe_twice_same_metadata() {
+        let client = ClientID(0);
+        let request = jsonrpc::Request {
+            jsonrpc: "2.0".to_string(),
+            id: 123,
+            method: "dummy".to_string(),
+            params: Some(json!([100, 200])),
+        };
+        let mut next_instruction_id = ServerInstructionID(1);
+        let (send_client, mut receive_client) = unbounded_channel();
+        let mut http_senders = Vec::new();
+        let mut http_receivers = Vec::new();
+        let mut pubsub_senders = Vec::new();
+        let mut pubsub_receivers = Vec::new();
+
+        {
+            let (sender, receiver) = unbounded_channel();
+            http_senders.push(sender);
+            http_receivers.push(receiver);
+
+            let (sender, receiver) = unbounded_channel();
+            http_senders.push(sender);
+            http_receivers.push(receiver);
+        }
+
+        {
+            let (sender, receiver) = unbounded_channel();
+            pubsub_senders.push(sender);
+            pubsub_receivers.push(receiver);
+
+            let (sender, receiver) = unbounded_channel();
+            pubsub_senders.push(sender);
+            pubsub_receivers.push(receiver);
+        }
+
+        let mut handler = DummyHandler {
+            tracker: SubscriptionTracker::new(),
+        };
+        handler.subscribe(
+            client,
+            &request,
+            &mut next_instruction_id,
+            send_client.clone(),
+            pubsub_senders.as_slice(),
+            http_senders.as_slice(),
+        );
+
+        if let Some(ServerToClient::Message(message)) = receive_client.recv().await {
+            assert_eq!(
+                from_str::<Value>(&message).unwrap(),
+                json!({
+                    "jsonrpc": "2.0",
+                    "result": 1,
+                    "id": 123,
+                })
+            );
+        } else {
+            panic!();
+        }
+
+        let client = ClientID(1);
+        let request = jsonrpc::Request {
+            jsonrpc: "2.0".to_string(),
+            id: 456,
+            method: "dummy".to_string(),
+            params: Some(json!([300, 200])),
+        };
+        handler.subscribe(
+            client,
+            &request,
+            &mut next_instruction_id,
+            send_client,
+            pubsub_senders.as_slice(),
+            http_senders.as_slice(),
+        );
+
+        if let Some(ServerToClient::Message(message)) = receive_client.recv().await {
+            assert_eq!(
+                from_str::<Value>(&message).unwrap(),
+                json!({
+                    "jsonrpc": "2.0",
+                    "result": 1,
+                    "id": 456,
+                })
+            );
+        } else {
+            panic!();
+        }
+
+        for mut receiver in http_receivers.drain(0..) {
+            if let Some(ServerToHTTP::Subscribe {
+                subscription,
+                request,
+                method,
+            }) = receiver.recv().await
+            {
+                assert_eq!(subscription, ServerInstructionID(1));
+                assert_eq!(request, "http 1 200");
+                assert_eq!(method, "poll");
+            } else {
+                panic!();
+            }
+        }
+
+        for mut receiver in pubsub_receivers.drain(0..) {
+            if let Some(ServerToPubsub::Subscribe {
+                subscription,
+                request,
+            }) = receiver.recv().await
+            {
+                assert_eq!(subscription, ServerInstructionID(1));
+                assert_eq!(request, "pubsub 1 200");
+            } else {
+                panic!();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn subscribe_twice_different_metadata() {
+        let client = ClientID(0);
+        let request = jsonrpc::Request {
+            jsonrpc: "2.0".to_string(),
+            id: 123,
+            method: "dummy".to_string(),
+            params: Some(json!([100, 200])),
+        };
+        let mut next_instruction_id = ServerInstructionID(1);
+        let (send_client, mut receive_client) = unbounded_channel();
+        let mut http_senders = Vec::new();
+        let mut http_receivers = Vec::new();
+        let mut pubsub_senders = Vec::new();
+        let mut pubsub_receivers = Vec::new();
+
+        {
+            let (sender, receiver) = unbounded_channel();
+            http_senders.push(sender);
+            http_receivers.push(receiver);
+
+            let (sender, receiver) = unbounded_channel();
+            http_senders.push(sender);
+            http_receivers.push(receiver);
+        }
+
+        {
+            let (sender, receiver) = unbounded_channel();
+            pubsub_senders.push(sender);
+            pubsub_receivers.push(receiver);
+
+            let (sender, receiver) = unbounded_channel();
+            pubsub_senders.push(sender);
+            pubsub_receivers.push(receiver);
+        }
+
+        let mut handler = DummyHandler {
+            tracker: SubscriptionTracker::new(),
+        };
+        handler.subscribe(
+            client,
+            &request,
+            &mut next_instruction_id,
+            send_client.clone(),
+            pubsub_senders.as_slice(),
+            http_senders.as_slice(),
+        );
+
+        if let Some(ServerToClient::Message(message)) = receive_client.recv().await {
+            assert_eq!(
+                from_str::<Value>(&message).unwrap(),
+                json!({
+                    "jsonrpc": "2.0",
+                    "result": 1,
+                    "id": 123,
+                })
+            );
+        } else {
+            panic!();
+        }
+
+        let client = ClientID(1);
+        let request = jsonrpc::Request {
+            jsonrpc: "2.0".to_string(),
+            id: 456,
+            method: "dummy".to_string(),
+            params: Some(json!([100, 300])),
+        };
+        handler.subscribe(
+            client,
+            &request,
+            &mut next_instruction_id,
+            send_client,
+            pubsub_senders.as_slice(),
+            http_senders.as_slice(),
+        );
+
+        if let Some(ServerToClient::Message(message)) = receive_client.recv().await {
+            assert_eq!(
+                from_str::<Value>(&message).unwrap(),
+                json!({
+                    "jsonrpc": "2.0",
+                    "result": 2,
+                    "id": 456,
+                })
+            );
+        } else {
+            panic!();
+        }
+
+        for mut receiver in http_receivers.drain(0..) {
+            if let Some(ServerToHTTP::Subscribe {
+                subscription,
+                request,
+                method,
+            }) = receiver.recv().await
+            {
+                assert_eq!(subscription, ServerInstructionID(1));
+                assert_eq!(request, "http 1 200");
+                assert_eq!(method, "poll");
+            } else {
+                panic!();
+            }
+            if let Some(ServerToHTTP::Subscribe {
+                subscription,
+                request,
+                method,
+            }) = receiver.recv().await
+            {
+                assert_eq!(subscription, ServerInstructionID(2));
+                assert_eq!(request, "http 2 300");
+                assert_eq!(method, "poll");
+            } else {
+                panic!();
+            }
+        }
+
+        for mut receiver in pubsub_receivers.drain(0..) {
+            if let Some(ServerToPubsub::Subscribe {
+                subscription,
+                request,
+            }) = receiver.recv().await
+            {
+                assert_eq!(subscription, ServerInstructionID(1));
+                assert_eq!(request, "pubsub 1 200");
+            } else {
+                panic!();
+            }
+
+            if let Some(ServerToPubsub::Subscribe {
+                subscription,
+                request,
+            }) = receiver.recv().await
+            {
+                assert_eq!(subscription, ServerInstructionID(2));
+                assert_eq!(request, "pubsub 2 300");
+            } else {
+                panic!();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn subscribe_twice_notify() {
+        let mut send_to_client = HashMap::new();
+
+        let client = ClientID(0);
+        let request = jsonrpc::Request {
+            jsonrpc: "2.0".to_string(),
+            id: 123,
+            method: "dummy".to_string(),
+            params: Some(json!([100, 200])),
+        };
+        let mut next_instruction_id = ServerInstructionID(1);
+        let (send_client, mut receive_client_0) = unbounded_channel();
+        send_to_client.insert(client.clone(), send_client.clone());
+        let mut http_senders = Vec::new();
+        let mut http_receivers = Vec::new();
+        let mut pubsub_senders = Vec::new();
+        let mut pubsub_receivers = Vec::new();
+
+        {
+            let (sender, receiver) = unbounded_channel();
+            http_senders.push(sender);
+            http_receivers.push(receiver);
+
+            let (sender, receiver) = unbounded_channel();
+            http_senders.push(sender);
+            http_receivers.push(receiver);
+        }
+
+        {
+            let (sender, receiver) = unbounded_channel();
+            pubsub_senders.push(sender);
+            pubsub_receivers.push(receiver);
+
+            let (sender, receiver) = unbounded_channel();
+            pubsub_senders.push(sender);
+            pubsub_receivers.push(receiver);
+        }
+
+        let mut handler = DummyHandler {
+            tracker: SubscriptionTracker::new(),
+        };
+        handler.subscribe(
+            client,
+            &request,
+            &mut next_instruction_id,
+            send_client.clone(),
+            pubsub_senders.as_slice(),
+            http_senders.as_slice(),
+        );
+
+        if let Some(ServerToClient::Message(message)) = receive_client_0.recv().await {
+            assert_eq!(
+                from_str::<Value>(&message).unwrap(),
+                json!({
+                    "jsonrpc": "2.0",
+                    "result": 1,
+                    "id": 123,
+                })
+            );
+        } else {
+            panic!();
+        }
+
+        let client = ClientID(1);
+        let request = jsonrpc::Request {
+            jsonrpc: "2.0".to_string(),
+            id: 456,
+            method: "dummy".to_string(),
+            params: Some(json!([300, 200])),
+        };
+        let (send_client, mut receive_client_1) = unbounded_channel();
+        send_to_client.insert(client.clone(), send_client.clone());
+        handler.subscribe(
+            client,
+            &request,
+            &mut next_instruction_id,
+            send_client,
+            pubsub_senders.as_slice(),
+            http_senders.as_slice(),
+        );
+
+        if let Some(ServerToClient::Message(message)) = receive_client_1.recv().await {
+            assert_eq!(
+                from_str::<Value>(&message).unwrap(),
+                json!({
+                    "jsonrpc": "2.0",
+                    "result": 1,
+                    "id": 456,
+                })
+            );
+        } else {
+            panic!();
+        }
+
+        let notification = jsonrpc::Notification {
+            jsonrpc: "2.0".to_string(),
+            method: "dummy".to_string(),
+            params: jsonrpc::NotificationParams {
+                result: json!({
+                    "context": {
+                        "slot": 1,
+                    },
+                    "number": 321,
+                }),
+                subscription: 1,
+            },
+        };
+
+        handler.broadcast(notification, &send_to_client);
+
+        for mut receiver in http_receivers.drain(0..) {
+            if let Some(ServerToHTTP::Subscribe {
+                subscription,
+                request,
+                method,
+            }) = receiver.recv().await
+            {
+                assert_eq!(subscription, ServerInstructionID(1));
+                assert_eq!(request, "http 1 200");
+                assert_eq!(method, "poll");
+            } else {
+                panic!();
+            }
+        }
+
+        for mut receiver in pubsub_receivers.drain(0..) {
+            if let Some(ServerToPubsub::Subscribe {
+                subscription,
+                request,
+            }) = receiver.recv().await
+            {
+                assert_eq!(subscription, ServerInstructionID(1));
+                assert_eq!(request, "pubsub 1 200");
+            } else {
+                panic!();
+            }
+        }
+
+        if let Some(ServerToClient::Message(message)) = receive_client_0.recv().await {
+            assert_eq!(from_str::<Value>(&message).unwrap(), json!(100 + 321),);
+        } else {
+            panic!();
+        }
+
+        if let Some(ServerToClient::Message(message)) = receive_client_1.recv().await {
+            assert_eq!(from_str::<Value>(&message).unwrap(), json!(300 + 321),);
+        } else {
+            panic!();
+        }
+    }
+
+    #[tokio::test]
+    async fn unsubscribe_one_client() {
+        let mut send_to_client = HashMap::new();
+
+        let client = ClientID(0);
+        let request = jsonrpc::Request {
+            jsonrpc: "2.0".to_string(),
+            id: 123,
+            method: "dummy".to_string(),
+            params: Some(json!([100, 200])),
+        };
+        let mut next_instruction_id = ServerInstructionID(1);
+        let (send_client, mut receive_client_0) = unbounded_channel();
+        send_to_client.insert(client.clone(), send_client.clone());
+        let mut http_senders = Vec::new();
+        let mut http_receivers = Vec::new();
+        let mut pubsub_senders = Vec::new();
+        let mut pubsub_receivers = Vec::new();
+
+        {
+            let (sender, receiver) = unbounded_channel();
+            http_senders.push(sender);
+            http_receivers.push(receiver);
+
+            let (sender, receiver) = unbounded_channel();
+            http_senders.push(sender);
+            http_receivers.push(receiver);
+        }
+
+        {
+            let (sender, receiver) = unbounded_channel();
+            pubsub_senders.push(sender);
+            pubsub_receivers.push(receiver);
+
+            let (sender, receiver) = unbounded_channel();
+            pubsub_senders.push(sender);
+            pubsub_receivers.push(receiver);
+        }
+
+        let mut handler = DummyHandler {
+            tracker: SubscriptionTracker::new(),
+        };
+        handler.subscribe(
+            client,
+            &request,
+            &mut next_instruction_id,
+            send_client.clone(),
+            pubsub_senders.as_slice(),
+            http_senders.as_slice(),
+        );
+
+        if let Some(ServerToClient::Message(message)) = receive_client_0.recv().await {
+            assert_eq!(
+                from_str::<Value>(&message).unwrap(),
+                json!({
+                    "jsonrpc": "2.0",
+                    "result": 1,
+                    "id": 123,
+                })
+            );
+        } else {
+            panic!();
+        }
+
+        let client = ClientID(1);
+        let request = jsonrpc::Request {
+            jsonrpc: "2.0".to_string(),
+            id: 456,
+            method: "dummy".to_string(),
+            params: Some(json!([300, 200])),
+        };
+        let (send_client, mut receive_client_1) = unbounded_channel();
+        send_to_client.insert(client.clone(), send_client.clone());
+        handler.subscribe(
+            client,
+            &request,
+            &mut next_instruction_id,
+            send_client,
+            pubsub_senders.as_slice(),
+            http_senders.as_slice(),
+        );
+
+        if let Some(ServerToClient::Message(message)) = receive_client_1.recv().await {
+            assert_eq!(
+                from_str::<Value>(&message).unwrap(),
+                json!({
+                    "jsonrpc": "2.0",
+                    "result": 1,
+                    "id": 456,
+                })
+            );
+        } else {
+            panic!();
+        }
+
+        let notification = jsonrpc::Notification {
+            jsonrpc: "2.0".to_string(),
+            method: "dummy".to_string(),
+            params: jsonrpc::NotificationParams {
+                result: json!({
+                    "context": {
+                        "slot": 1,
+                    },
+                    "number": 321,
+                }),
+                subscription: 1,
+            },
+        };
+
+        handler.unsubscribe_client(
+            ClientID(1),
+            &mut next_instruction_id,
+            pubsub_senders.as_slice(),
+            http_senders.as_slice(),
+        );
+
+        handler.broadcast(notification, &send_to_client);
+
+        for mut receiver in http_receivers.drain(0..) {
+            if let Some(ServerToHTTP::Subscribe {
+                subscription,
+                request,
+                method,
+            }) = receiver.recv().await
+            {
+                assert_eq!(subscription, ServerInstructionID(1));
+                assert_eq!(request, "http 1 200");
+                assert_eq!(method, "poll");
+            } else {
+                panic!();
+            }
+        }
+
+        for mut receiver in pubsub_receivers.drain(0..) {
+            if let Some(ServerToPubsub::Subscribe {
+                subscription,
+                request,
+            }) = receiver.recv().await
+            {
+                assert_eq!(subscription, ServerInstructionID(1));
+                assert_eq!(request, "pubsub 1 200");
+            } else {
+                panic!();
+            }
+        }
+
+        if let Some(ServerToClient::Message(message)) = receive_client_0.recv().await {
+            assert_eq!(from_str::<Value>(&message).unwrap(), json!(100 + 321),);
+        } else {
+            panic!();
         }
     }
 }

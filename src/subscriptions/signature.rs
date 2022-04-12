@@ -98,3 +98,130 @@ impl SubscriptionHandler<Subscription, Metadata> for SignatureSubscriptionHandle
         ""
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{from_str, json, Value};
+
+    #[test]
+    fn format_pubsub_subscribe() {
+        let metadata = Metadata {
+            transaction: String::from("hear ye hear ye"),
+            commitment: Commitment::Confirmed,
+        };
+        let id = ServerInstructionID(42);
+
+        let got = SignatureSubscriptionHandler::format_pubsub_subscribe(&id, &metadata);
+        assert_eq!(
+            from_str::<Value>(&got).unwrap(),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 42,
+                "method": "signatureSubscribe",
+                "params": [
+                    "hear ye hear ye",
+                    {
+                        "commitment": "confirmed",
+                    }
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn parse_subscription_fails_without_params() {
+        let request = jsonrpc::Request {
+            jsonrpc: "2.0".to_string(),
+            method: "signatureSubscribe".to_string(),
+            id: 42,
+            params: None,
+        };
+        let result = SignatureSubscriptionHandler::parse_subscription(&request);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_subscription_fails_with_non_array_params() {
+        let request = jsonrpc::Request {
+            jsonrpc: "2.0".to_string(),
+            method: "signatureSubscribe".to_string(),
+            id: 42,
+            params: Some(serde_json::Value::String("what's up?".to_string())),
+        };
+        let result = SignatureSubscriptionHandler::parse_subscription(&request);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_subscription_fails_with_missing_signature() {
+        let request = jsonrpc::Request {
+            jsonrpc: "2.0".to_string(),
+            method: "signatureSubscribe".to_string(),
+            id: 42,
+            params: Some(serde_json::Value::Array(vec![])),
+        };
+        let result = SignatureSubscriptionHandler::parse_subscription(&request);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_subscription_fails_with_non_string_signature() {
+        let request = jsonrpc::Request {
+            jsonrpc: "2.0".to_string(),
+            method: "signatureSubscribe".to_string(),
+            id: 42,
+            params: Some(serde_json::Value::Array(vec![serde_json::Value::Bool(
+                true,
+            )])),
+        };
+        let result = SignatureSubscriptionHandler::parse_subscription(&request);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_subscription_with_signature() {
+        let request = jsonrpc::Request {
+            jsonrpc: "2.0".to_string(),
+            method: "signatureSubscribe".to_string(),
+            id: 42,
+            params: Some(serde_json::json!(["hello world"])),
+        };
+        let result = SignatureSubscriptionHandler::parse_subscription(&request);
+        assert!(result.is_ok());
+        let (subscription, metadata) = result.unwrap();
+        assert_eq!(subscription, Subscription {});
+        assert_eq!(
+            metadata,
+            Metadata {
+                transaction: "hello world".to_string(),
+                commitment: Commitment::Finalized,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_subscription_with_commitment() {
+        let request = jsonrpc::Request {
+            jsonrpc: "2.0".to_string(),
+            method: "signatureSubscribe".to_string(),
+            id: 42,
+            params: Some(serde_json::json!(["hello world", {"commitment": "processed"}])),
+        };
+        let result = SignatureSubscriptionHandler::parse_subscription(&request);
+        assert!(result.is_ok());
+        let (subscription, metadata) = result.unwrap();
+        assert_eq!(subscription, Subscription {});
+        assert_eq!(
+            metadata,
+            Metadata {
+                transaction: "hello world".to_string(),
+                commitment: Commitment::Processed,
+            }
+        );
+    }
+}

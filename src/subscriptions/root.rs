@@ -70,3 +70,41 @@ impl SubscriptionHandler<Subscription, Metadata> for RootSubscriptionHandler {
         return None;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{from_str, json, Value};
+
+    #[test]
+    fn format_pubsub_subscribe() {
+        let metadata = Metadata {};
+        let id = ServerInstructionID(42);
+
+        let got = RootSubscriptionHandler::format_pubsub_subscribe(&id, &metadata);
+        assert_eq!(
+            from_str::<Value>(&got).unwrap(),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 42,
+                "method": "rootSubscribe",
+            })
+        );
+    }
+
+    #[test]
+    fn get_notification_timestamp() {
+        let notification = jsonrpc::Notification {
+            jsonrpc: "2.0".to_string(),
+            method: "rootNotification".to_string(),
+            params: jsonrpc::NotificationParams {
+                subscription: 42,
+                result: json!(999),
+            },
+        };
+        assert_eq!(
+            RootSubscriptionHandler::get_notification_timestamp(&notification),
+            Some(999),
+        );
+    }
+}

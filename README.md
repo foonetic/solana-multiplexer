@@ -68,3 +68,12 @@ pubsub_message_count{endpoint="wss://api.devnet.solana.com/",type="pong"} 7
 pubsub_message_count{endpoint="wss://api.devnet.solana.com/",type="subscribe"} 12
 pubsub_message_count{endpoint="wss://api.devnet.solana.com/",type="unsubscribe"} 12
 ```
+
+## Error handling
+
+The multiplexer will attempt to reconnect broken websocket connections with an
+exponential backoff. Upon successful connection, all existing notifications will
+be automatically re-subscribed. 
+
+Malformed messages will be silently dropped rather than forwarded to the client.
+These will show up as pubsub messages of type error in the reported metrics.

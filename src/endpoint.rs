@@ -1,5 +1,8 @@
 use crate::{channel_types::*, jsonrpc, metrics};
-use futures_util::{stream::SplitStream, SinkExt, StreamExt};
+use futures_util::{
+    stream::{SplitSink, SplitStream},
+    SinkExt, StreamExt,
+};
 use std::{
     collections::{hash_map::Entry, HashMap},
     sync::Arc,
@@ -41,8 +44,47 @@ pub struct PubsubEndpoint {
     enqueue: UnboundedSender<Message>,
     send_to_server: UnboundedSender<EndpointToServer>,
     receive_from_server: UnboundedReceiver<ServerToPubsub>,
+    read_receiver: UnboundedReceiver<SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>>,
     global_to_local_subscriber: HashMap<ServerInstructionID, EndpointSubscriberID>,
     local_to_global_subscriber: HashMap<EndpointSubscriberID, ServerInstructionID>,
+    subscription_requests: HashMap<ServerInstructionID, String>,
+}
+
+fn spawn_disconnect_handler(
+    url: Url,
+    mut disconnect: UnboundedReceiver<bool>,
+    reader: UnboundedSender<SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>>,
+    writer: UnboundedSender<SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>>,
+) {
+    tokio::spawn(async move {
+        while let Some(disconnected) = disconnect.recv().await {
+            if disconnected {
+                let mut sleep_amount = 1;
+                loop {
+                    info!("trying to reconnect to {}", url);
+                    match tokio_tungstenite::connect_async(url.clone()).await {
+                        Ok((new_ws, _)) => {
+                            let (new_writer, new_reader) = new_ws.split();
+                            reader.send(new_reader).unwrap();
+                            writer.send(new_writer).unwrap();
+                            info!("reconnected to {}", url);
+                            break;
+                        }
+                        Err(err) => {
+                            error!(
+                                "unable to reconnect to {}, trying again after {} seconds: {}",
+                                url, sleep_amount, err
+                            );
+                            tokio::time::sleep(std::time::Duration::from_secs(sleep_amount)).await;
+                            if sleep_amount < 64 {
+                                sleep_amount *= 2;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    });
 }
 
 impl PubsubEndpoint {
@@ -53,16 +95,31 @@ impl PubsubEndpoint {
         receive_from_server: UnboundedReceiver<ServerToPubsub>,
     ) -> Self {
         let (mut writer, reader) = ws.split();
-        let (enqueue, mut dequeue) = unbounded_channel();
+        let (enqueue, mut dequeue) = unbounded_channel::<Message>();
 
-        tokio::spawn(async move {
-            while let Some(message) = dequeue.recv().await {
-                if let Err(err) = writer.send(message).await {
-                    error!(error_writing_to_client = err.to_string().as_str());
-                    return;
+        let (disconnect_sender, disconnect_receiver) = unbounded_channel();
+        let (read_sender, read_receiver) = unbounded_channel();
+        let (write_sender, mut write_receiver) = unbounded_channel();
+
+        spawn_disconnect_handler(url.clone(), disconnect_receiver, read_sender, write_sender);
+
+        {
+            let enqueue = enqueue.clone();
+            tokio::spawn(async move {
+                while let Some(message) = dequeue.recv().await {
+                    let msg = message.clone();
+                    if let Err(err) = writer.send(msg).await {
+                        // On send error, issue a disconnect event, which will
+                        // refresh the connection. Enqueue the message, which was
+                        // not sent.
+                        error!(error_writing_to_client = err.to_string().as_str());
+                        disconnect_sender.send(true).unwrap();
+                        enqueue.send(message).unwrap();
+                        writer = write_receiver.recv().await.unwrap();
+                    }
                 }
-            }
-        });
+            });
+        }
 
         Self {
             url,
@@ -70,8 +127,28 @@ impl PubsubEndpoint {
             enqueue,
             send_to_server,
             receive_from_server,
+            read_receiver,
             global_to_local_subscriber: HashMap::new(),
             local_to_global_subscriber: HashMap::new(),
+            subscription_requests: HashMap::new(),
+        }
+    }
+
+    fn handle_disconnect(
+        &mut self,
+        reader: SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>,
+    ) {
+        self.reader = reader;
+
+        // The cached subscriptions are no longer valid.
+        self.global_to_local_subscriber.clear();
+        self.local_to_global_subscriber.clear();
+
+        // Re-send subscriptions since it's a new connection.
+        for (_subscription_id, request) in self.subscription_requests.iter() {
+            if let Err(err) = self.enqueue.send(Message::Text(request.clone())) {
+                error!("failed to enqueue pubsub write: {}", err);
+            }
         }
     }
 
@@ -80,17 +157,40 @@ impl PubsubEndpoint {
         let mut interval = time::interval(Duration::from_secs(30));
         loop {
             tokio::select! {
+                // On a disconnect, we will receieve a new reader.
+                Some(reader) = self.read_receiver.recv() => {
+                    self.handle_disconnect(reader);
+                }
+
                 Some(message) = self.receive_from_server.recv() => {
                     self.on_instruction(message);
                 }
 
                 message = self.reader.next() => {
                     if message.is_none() {
-                        return;
+                        // Send a ping, which will force an error on disconnect.
+                        if let Err(err) = self.enqueue.send(Message::Ping(vec![0])) {
+                            error!("pubsub endpoint failed to ping: {}", err);
+                            return;
+                        }
+
+                        // A ping error will refresh the connection and send a new reader.
+                        let reader = self.read_receiver.recv().await.unwrap();
+                        self.handle_disconnect(reader);
+                        continue;
                     }
                     let message = message.unwrap();
                     if message.is_err() {
-                        return;
+                        // Send a ping, which will force an error on disconnect.
+                        if let Err(err) = self.enqueue.send(Message::Ping(vec![0])) {
+                            error!("pubsub endpoint failed to ping: {}", err);
+                            return;
+                        }
+
+                        // A ping error will refresh the connection and send a new reader.
+                        let reader = self.read_receiver.recv().await.unwrap();
+                        self.handle_disconnect(reader);
+                        continue;
                     }
                     self.on_message(message.unwrap());
                 }
@@ -204,7 +304,7 @@ impl PubsubEndpoint {
         }
     }
 
-    /// Handles a subscriptiohn reply. Maps the subscription ID to the global
+    /// Handles a subscription reply. Maps the subscription ID to the global
     /// unique ID that was used in the subscription request.
     fn on_subscribe_reply(&mut self, reply: jsonrpc::SubscribeResponse) {
         self.global_to_local_subscriber.insert(
@@ -228,6 +328,8 @@ impl PubsubEndpoint {
                     "pubsub endpoint subscribing to global id {}",
                     subscription.0
                 );
+                self.subscription_requests
+                    .insert(subscription.clone(), request.clone());
                 if let Err(err) = self.enqueue.send(Message::Text(request)) {
                     error!("failed to enqueue pubsub write: {}", err);
                 }
@@ -239,6 +341,7 @@ impl PubsubEndpoint {
                 method,
             } => {
                 let entry = self.global_to_local_subscriber.entry(subscription.clone());
+                self.subscription_requests.remove(&subscription);
                 match entry {
                     Entry::Occupied(got) => {
                         info!(
@@ -454,18 +557,49 @@ impl HTTPEndpoint {
                 let body =
                     serde_json::to_string(&request).expect("unable to serialize json request");
                 tokio::spawn(async move {
-                    if let Ok(result) = client
+                    match client
                         .post(url.clone())
                         .body(body)
                         .header("content-type", "application/json")
                         .send()
                         .await
                     {
-                        metrics::HTTP_MESSAGE_COUNT
-                            .with_label_values(&[url.as_str(), result.status().as_str()])
-                            .inc();
-                        if let Ok(text) = result.text().await {
-                            if let Err(err) = sender.send(ServerToClient::Message(text)) {
+                        Ok(result) => {
+                            metrics::HTTP_MESSAGE_COUNT
+                                .with_label_values(&[url.as_str(), result.status().as_str()])
+                                .inc();
+                            match result.text().await {
+                                Ok(text) => {
+                                    if let Err(err) = sender.send(ServerToClient::Message(text)) {
+                                        error!("direct http request failed: {}", err);
+                                    }
+                                }
+                                Err(err) => {
+                                    if let Err(err) = sender.send(ServerToClient::Message(
+                                        serde_json::to_string(&jsonrpc::Error {
+                                            jsonrpc: "2.0".to_string(),
+                                            id: -1,
+                                            code: jsonrpc::ErrorCode::InternalError,
+                                            message: err.to_string(),
+                                        })
+                                        .expect("could not serialize json error"),
+                                    )) {
+                                        error!("direct http request failed: {}", err);
+                                    }
+                                }
+                            }
+                        }
+
+                        Err(err) => {
+                            if let Err(err) = sender.send(ServerToClient::Message(
+                                serde_json::to_string(&jsonrpc::Error {
+                                    jsonrpc: "2.0".to_string(),
+                                    id: -1,
+                                    code: jsonrpc::ErrorCode::InternalError,
+                                    message: err.to_string(),
+                                })
+                                .expect("could not serialize json error"),
+                            )) {
                                 error!("direct http request failed: {}", err);
                             }
                         }

@@ -20,6 +20,12 @@ lazy_static! {
             &["endpoint", "type"],
         )
         .unwrap();
+    pub static ref HTTP_MESSAGE_COUNT: prometheus::IntCounterVec =
+        prometheus::register_int_counter_vec!(
+            Opts::new("http_message_count", "HTTP message count"),
+            &["endpoint", "response_code"],
+        )
+        .unwrap();
     pub static ref LATEST_SLOT_SEEN: prometheus::IntGaugeVec = prometheus::register_int_gauge_vec!(
         Opts::new(
             "latest_slot_seen",

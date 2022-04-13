@@ -321,6 +321,10 @@ impl HTTPPoll {
             .send()
             .await
         {
+            metrics::HTTP_MESSAGE_COUNT
+                .with_label_values(&[self.url.as_str(), result.status().as_str()])
+                .inc();
+
             if let Ok(text) = result.text().await {
                 if let Ok(response) = serde_json::from_str::<jsonrpc::Response>(&text) {
                     // Reformat to look like a websocket reply.
@@ -451,12 +455,15 @@ impl HTTPEndpoint {
                     serde_json::to_string(&request).expect("unable to serialize json request");
                 tokio::spawn(async move {
                     if let Ok(result) = client
-                        .post(url)
+                        .post(url.clone())
                         .body(body)
                         .header("content-type", "application/json")
                         .send()
                         .await
                     {
+                        metrics::HTTP_MESSAGE_COUNT
+                            .with_label_values(&[url.as_str(), result.status().as_str()])
+                            .inc();
                         if let Ok(text) = result.text().await {
                             if let Err(err) = sender.send(ServerToClient::Message(text)) {
                                 error!("direct http request failed: {}", err);
